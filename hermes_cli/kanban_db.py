@@ -517,6 +517,8 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     """
     entries: list[dict] = []
     seen: set[str] = set()
+    seen_real_dirs: dict[str, int] = {}
+    current = get_current_board()
 
     # Default board is always first.
     entries.append(read_board_metadata(DEFAULT_BOARD))
@@ -540,11 +542,33 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
             has_meta = (child / "board.json").exists()
             if not (has_db or has_meta):
                 continue
+
+            # Board slug aliases are represented as directory symlinks during
+            # safe renames (for example while workers are still using the old
+            # slug).  Without de-duping by real directory, both the alias and
+            # its target appear in the dashboard selector with identical counts.
+            # Prefer the active slug when it is one of the aliases; otherwise
+            # keep the first slug in display order.
+            try:
+                real_dir = str(child.resolve())
+            except OSError:
+                real_dir = str(child.absolute())
+            prior_idx = seen_real_dirs.get(real_dir)
+            if prior_idx is not None:
+                if normed == current:
+                    prior_slug = entries[prior_idx].get("slug")
+                    if isinstance(prior_slug, str):
+                        seen.discard(prior_slug)
+                    entries[prior_idx] = read_board_metadata(normed)
+                    seen.add(normed)
+                continue
+
             meta = read_board_metadata(normed)
             if meta.get("archived") and not include_archived:
                 continue
             entries.append(meta)
             seen.add(normed)
+            seen_real_dirs[real_dir] = len(entries) - 1
     return entries
 
 

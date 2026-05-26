@@ -3907,16 +3907,28 @@ class DiscordAdapter(BasePlatformAdapter):
     # Auto-thread helpers
     # ------------------------------------------------------------------
 
-    async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
-        """Create a thread from a user message for auto-threading.
+    async def _auto_create_thread(
+        self,
+        message: Any,
+        *,
+        anchor_message: Optional[Any] = None,
+    ) -> Optional[Any]:
+        """Create a thread for auto-threading.
+
+        Normal top-level messages create a thread from the user message.  When
+        the user quote-replies to a channel message (for example replying to a
+        scheduled report), ``anchor_message`` lets us create the thread from
+        the replied-to message so the thread is visually attached to the report
+        rather than to the short follow-up reply.
 
         Returns the created thread object, or ``None`` on failure.
         """
+        title_source = anchor_message or message
         # Build a short thread name from the message. Strip Discord mention
         # syntax (users / roles / channels) so thread titles don't end up
         # showing raw <@id>, <@&id>, or <#id> markers — the ID isn't
         # meaningful to humans glancing at the thread list (#6336).
-        content = (message.content or "").strip()
+        content = (getattr(title_source, "content", None) or message.content or "").strip()
         # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
         content = re.sub(r"<@[!&]?\d+>", "", content)
         content = re.sub(r"<#\d+>", "", content)
@@ -3925,12 +3937,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if len(content) > 80:
             thread_name = thread_name[:77] + "..."
 
+        thread_source = anchor_message or message
         try:
-            thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+            thread = await thread_source.create_thread(name=thread_name, auto_archive_duration=1440)
             return thread
         except Exception as direct_error:
             display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
-            reason = f"Auto-threaded from mention by {display_name}"
+            reason = f"Auto-threaded from Discord message by {display_name}"
             try:
                 seed_msg = await message.channel.send(f"\U0001f9f5 Thread created by Hermes: **{thread_name}**")
                 thread = await seed_msg.create_thread(
@@ -3947,6 +3960,26 @@ class DiscordAdapter(BasePlatformAdapter):
                     fallback_error,
                 )
                 return None
+
+    async def _resolve_reply_anchor_message(self, message: Any) -> Optional[Any]:
+        """Best-effort lookup of the message being replied to."""
+        reference = getattr(message, "reference", None)
+        if reference is None:
+            return None
+        resolved = getattr(reference, "resolved", None)
+        if resolved is not None:
+            return resolved
+        message_id = getattr(reference, "message_id", None)
+        if message_id is None:
+            return None
+        fetch_message = getattr(getattr(message, "channel", None), "fetch_message", None)
+        if fetch_message is None:
+            return None
+        try:
+            return await fetch_message(message_id)
+        except Exception as exc:
+            logger.debug("[%s] Could not resolve reply anchor %s: %s", self.name, message_id, exc)
+            return None
 
     async def create_handoff_thread(
         self,
@@ -4494,6 +4527,8 @@ class DiscordAdapter(BasePlatformAdapter):
             normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
             normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+        channel_ids: set[str] = set()
+        is_voice_linked_channel = False
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -4552,11 +4587,15 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
-                thread = await self._auto_create_thread(message)
+            # Free-response controls whether Hermes needs an @mention; it should
+            # not implicitly disable auto-threading.  Channels that should stay
+            # inline must be listed explicitly in DISCORD_NO_THREAD_CHANNELS.
+            skip_thread = bool(channel_ids & no_thread_channels) or is_voice_linked_channel
+            if auto_thread and not skip_thread and not is_voice_linked_channel:
+                anchor_message = await self._resolve_reply_anchor_message(message) if is_reply_message else None
+                thread = await self._auto_create_thread(message, anchor_message=anchor_message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True

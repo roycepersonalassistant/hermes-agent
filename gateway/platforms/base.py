@@ -12,13 +12,14 @@ import logging
 import os
 import random
 import re
+import shutil
 import socket as _socket
 import subprocess
 import sys
 import time
 import uuid
 from abc import ABC, abstractmethod
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from utils import normalize_proxy_url
 
@@ -2431,6 +2432,127 @@ class BasePlatformAdapter(ABC):
         return media, cleaned
 
     @staticmethod
+    def _discord_local_markdown_links(content: str) -> str:
+        """Replace local .md paths with Royce's localhost Obsidian opener URLs.
+
+        Discord does not reliably make raw filesystem paths, file:// URLs, or
+        obsidian:// URLs clickable.  For local Markdown reports, keep the text
+        lightweight and clickable by using the local opener service instead of
+        stripping the path and uploading the file as an attachment.
+        """
+        if not content:
+            return content
+
+        path_re = re.compile(
+            r'(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.md\b',
+            re.IGNORECASE,
+        )
+        code_spans: list = []
+        for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
+            code_spans.append((m.start(), m.end()))
+        for m in re.finditer(r'`[^`\n]+`', content):
+            code_spans.append((m.start(), m.end()))
+
+        def _in_code(pos: int) -> bool:
+            return any(s <= pos < e for s, e in code_spans)
+
+        def _link_path(expanded: str) -> str:
+            # The LaunchAgent-hosted opener can be blocked by macOS TCC from
+            # reading hidden report paths under Documents.  Mirror report files
+            # into the known Hermes Obsidian vault before generating the URL so
+            # Discord links point at a vault-local file the opener can read.
+            try:
+                report_root = os.path.realpath("/Users/royce/Documents/hermes/.hermes/reports")
+                src_real = os.path.realpath(expanded)
+                if src_real.startswith(report_root + os.sep):
+                    mirror_dir = "/Users/royce/Documents/Obsidian/Hermes/Hermes Reports"
+                    os.makedirs(mirror_dir, exist_ok=True)
+                    mirror_path = os.path.join(mirror_dir, os.path.basename(expanded))
+                    if (not os.path.exists(mirror_path)) or os.path.getmtime(expanded) > os.path.getmtime(mirror_path):
+                        shutil.copy2(expanded, mirror_path)
+                    return mirror_path
+            except OSError:
+                logger.debug("failed to mirror local Markdown report for Discord link", exc_info=True)
+            return expanded
+
+        def _replace(match: re.Match) -> str:
+            raw = match.group(0)
+            if _in_code(match.start()):
+                return raw
+            expanded = os.path.expanduser(raw)
+            if not os.path.isfile(expanded):
+                return raw
+            return "http://127.0.0.1:8765/open?path=" + quote(_link_path(expanded), safe='')
+
+        return path_re.sub(_replace, content)
+
+    @staticmethod
+    def _discord_codeblock_tables(content: str) -> str:
+        """Convert Markdown pipe tables to fixed-width fenced text for Discord."""
+        if not content or "|" not in content:
+            return content
+
+        def _is_separator(line: str) -> bool:
+            stripped = line.strip()
+            if "|" not in stripped:
+                return False
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            return bool(cells) and all(re.fullmatch(r":?-{3,}:?", c or "") for c in cells)
+
+        def _is_table_row(line: str) -> bool:
+            stripped = line.strip()
+            return "|" in stripped and not stripped.startswith("```")
+
+        def _cells(line: str) -> list[str]:
+            return [c.strip() for c in line.strip().strip("|").split("|")]
+
+        def _render(rows: list[str]) -> list[str]:
+            parsed = [_cells(row) for row in rows if not _is_separator(row)]
+            if not parsed:
+                return rows
+            width_count = max(len(row) for row in parsed)
+            widths = [0] * width_count
+            for row in parsed:
+                for idx in range(width_count):
+                    cell = row[idx] if idx < len(row) else ""
+                    widths[idx] = max(widths[idx], len(cell))
+            rendered = []
+            for row in parsed:
+                padded = [(row[idx] if idx < len(row) else "").ljust(widths[idx]) for idx in range(width_count)]
+                rendered.append("  ".join(padded).rstrip())
+            return ["```text", *rendered, "```"]
+
+        lines = content.splitlines()
+        out: list[str] = []
+        i = 0
+        in_fence = False
+        while i < len(lines):
+            line = lines[i]
+            if line.strip().startswith("```"):
+                in_fence = not in_fence
+                out.append(line)
+                i += 1
+                continue
+            if not in_fence and i + 1 < len(lines) and _is_table_row(line) and _is_separator(lines[i + 1]):
+                table_lines = [line, lines[i + 1]]
+                i += 2
+                while i < len(lines) and _is_table_row(lines[i]):
+                    table_lines.append(lines[i])
+                    i += 1
+                out.extend(_render(table_lines))
+                continue
+            out.append(line)
+            i += 1
+        return "\n".join(out)
+
+    def _format_response_for_platform(self, content: str) -> str:
+        """Apply platform-specific readability rewrites before media extraction."""
+        if self.platform == Platform.DISCORD:
+            content = self._discord_local_markdown_links(content)
+            content = self._discord_codeblock_tables(content)
+        return content
+
+    @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
         """
         Detect bare local file paths in response text for native delivery.
@@ -3585,6 +3707,7 @@ class BasePlatformAdapter(ABC):
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
+                text_content = self._format_response_for_platform(text_content)
                 # Strip any remaining internal directives from message body (fixes #1561)
                 text_content = text_content.replace("[[audio_as_voice]]", "").strip()
                 text_content = text_content.replace("[[as_document]]", "").strip()

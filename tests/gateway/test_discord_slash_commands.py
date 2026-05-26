@@ -590,7 +590,7 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
     seed_message.create_thread.assert_awaited_once_with(
         name="Hello",
         auto_archive_duration=1440,
-        reason="Auto-threaded from mention by Jezza",
+        reason="Auto-threaded from Discord message by Jezza",
     )
 
 
@@ -670,7 +670,7 @@ async def test_auto_thread_creates_thread_and_redirects(adapter, monkeypatch):
 
     await adapter._handle_message(msg)
 
-    adapter._auto_create_thread.assert_awaited_once_with(msg)
+    adapter._auto_create_thread.assert_awaited_once_with(msg, anchor_message=None)
     assert len(captured_events) == 1
     event = captured_events[0]
     assert event.source.chat_id == "999"  # redirected to thread

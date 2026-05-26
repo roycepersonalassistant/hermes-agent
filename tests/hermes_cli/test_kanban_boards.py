@@ -309,6 +309,30 @@ class TestBoardCRUD:
         # Slug must not change.
         assert kb.board_exists("slug-immutable")
 
+    def test_list_boards_deduplicates_symlink_aliases(self, fresh_home):
+        kb.create_board("target", name="Display Name")
+        alias = fresh_home / "kanban" / "boards" / "alias"
+        try:
+            alias.symlink_to(kb.board_dir("target"), target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+
+        slugs = [b["slug"] for b in kb.list_boards()]
+        assert slugs == ["default", "alias"]
+        assert kb.list_boards()[1]["name"] == "Display Name"
+
+    def test_list_boards_prefers_current_slug_for_symlink_alias(self, fresh_home):
+        kb.create_board("target", name="Display Name")
+        alias = fresh_home / "kanban" / "boards" / "alias"
+        try:
+            alias.symlink_to(kb.board_dir("target"), target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+        kb.set_current_board("target")
+
+        slugs = [b["slug"] for b in kb.list_boards()]
+        assert slugs == ["default", "target"]
+
 
 # ---------------------------------------------------------------------------
 # Connection isolation
