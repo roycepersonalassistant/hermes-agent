@@ -16,6 +16,7 @@ from tests.e2e.conftest import (
     make_discord_message,
     make_fake_dm_channel,
     make_fake_thread,
+    CHANNEL_ID,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -98,6 +99,24 @@ class TestAutoThreadingPreservesCommand:
             return fake_thread
 
         msg.create_thread = AsyncMock(side_effect=clobber_content)
+        await dispatch(discord_adapter, msg)
+
+        msg.create_thread.assert_awaited_once()
+        response = get_response_text(discord_adapter)
+        assert response is not None
+        assert "/new" in response
+
+    async def test_free_response_channel_auto_threads_without_mention(self, discord_adapter, monkeypatch):
+        """Free-response channels bypass mention gating but still auto-thread top-level posts."""
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", str(CHANNEL_ID))
+        monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
+
+        fake_thread = make_fake_thread(thread_id=90002, name="help")
+        msg = make_discord_message(content="/help", mentions=[])
+        msg.create_thread = AsyncMock(return_value=fake_thread)
+
         await dispatch(discord_adapter, msg)
 
         msg.create_thread.assert_awaited_once()
