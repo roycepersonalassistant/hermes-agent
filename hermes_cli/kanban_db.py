@@ -1206,6 +1206,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Required audit reason when a task/repository already owns a different
     -- active worktree and creation is intentionally replacing it.
     workspace_replacement_reason TEXT,
+    -- Durable correlation token written atomically with a terminal task status.
+    -- The shared workspace registry finalizes only the matching intent.
+    terminal_disposition_operation_id TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
@@ -2382,6 +2385,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "workspace_replacement_reason",
             "workspace_replacement_reason TEXT",
+        )
+    if "terminal_disposition_operation_id" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "terminal_disposition_operation_id",
+            "terminal_disposition_operation_id TEXT",
         )
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
@@ -4988,13 +4998,15 @@ def complete_task(
                 else None
             ),
         )
-        if _terminal_plans:
-            _workspaces.attach_registry(conn)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    from hermes_cli import kanban_workspaces as _workspaces
+
+    with _workspaces.terminal_task_transaction(
+        conn, _terminal_plans, terminal_status="done"
+    ) as _terminal_operation_id:
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5006,11 +5018,12 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       terminal_disposition_operation_id = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (result, now, _terminal_operation_id, task_id),
             )
         else:
             cur = conn.execute(
@@ -5023,21 +5036,22 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       terminal_disposition_operation_id = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (
+                    result,
+                    now,
+                    _terminal_operation_id,
+                    task_id,
+                    int(expected_run_id),
+                ),
             )
         if cur.rowcount != 1:
             return False
-        if _terminal_plans:
-            from hermes_cli import kanban_workspaces as _workspaces
-
-            _workspaces.apply_terminal_disposition_in_transaction(
-                conn, _terminal_plans
-            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -6428,23 +6442,20 @@ def archive_task(
             board_id=_board_for_connection(conn),
             disposition=workspace_disposition,
         )
-        if terminal_plans:
-            _workspaces.attach_registry(conn)
-    with write_txn(conn):
+    from hermes_cli import kanban_workspaces as _workspaces
+
+    with _workspaces.terminal_task_transaction(
+        conn, terminal_plans, terminal_status="archived"
+    ) as terminal_operation_id:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "    terminal_disposition_operation_id = ? "
             "WHERE id = ? AND status != 'archived'",
-            (task_id,),
+            (terminal_operation_id, task_id),
         )
         if cur.rowcount != 1:
             return False
-        if terminal_plans:
-            from hermes_cli import kanban_workspaces as _workspaces
-
-            _workspaces.apply_terminal_disposition_in_transaction(
-                conn, terminal_plans
-            )
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.

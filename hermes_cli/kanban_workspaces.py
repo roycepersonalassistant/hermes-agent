@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import time
@@ -22,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+import psutil
 import yaml
 
 
@@ -38,6 +40,7 @@ ACTIVE_REGISTRY_STATUSES = {
     "reserved",
     "active",
     "blocked",
+    "terminalizing",
     "terminal_clean",
     "terminal_dirty",
     "superseded",
@@ -45,6 +48,7 @@ ACTIVE_REGISTRY_STATUSES = {
     "protected",
 }
 RESERVATION_LEASE_SECONDS = 180
+TERMINAL_INTENT_LEASE_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -186,6 +190,36 @@ CREATE INDEX IF NOT EXISTS idx_workspaces_repo_head
     ON workspaces(repo_id, head_sha);
 CREATE INDEX IF NOT EXISTS idx_workspaces_status
     ON workspaces(status);
+CREATE TABLE IF NOT EXISTS terminal_disposition_intents (
+    operation_id            TEXT NOT NULL,
+    workspace_id            TEXT NOT NULL UNIQUE,
+    board_id                TEXT NOT NULL,
+    task_id                 TEXT NOT NULL,
+    terminal_status         TEXT NOT NULL,
+    task_db_path            TEXT NOT NULL,
+    expected_repo_id        TEXT NOT NULL,
+    expected_workspace_path TEXT NOT NULL,
+    expected_status         TEXT NOT NULL,
+    disposition             TEXT NOT NULL,
+    target_status           TEXT NOT NULL,
+    dirty_manifest_hash     TEXT,
+    exception_policy_id     TEXT,
+    exception_expires_at    INTEGER,
+    retention_condition     TEXT,
+    head_sha                TEXT,
+    branch                  TEXT,
+    pr_numbers              TEXT NOT NULL DEFAULT '',
+    estimated_bytes         INTEGER NOT NULL DEFAULT 0,
+    verified_at             INTEGER NOT NULL,
+    owner_host              TEXT NOT NULL,
+    owner_pid               INTEGER NOT NULL,
+    owner_started_at        REAL,
+    expires_at              INTEGER NOT NULL,
+    created_at              INTEGER NOT NULL,
+    PRIMARY KEY (operation_id, workspace_id)
+);
+CREATE INDEX IF NOT EXISTS idx_terminal_disposition_intents_task
+    ON terminal_disposition_intents(board_id, task_id, operation_id);
 """
 
 
@@ -238,6 +272,24 @@ def connect_registry() -> sqlite3.Connection:
         columns,
         "reservation_expires_at",
         "ALTER TABLE workspaces ADD COLUMN reservation_expires_at INTEGER",
+    )
+    intent_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(terminal_disposition_intents)"
+        ).fetchall()
+    }
+    _add_registry_column(
+        conn,
+        intent_columns,
+        "task_db_path",
+        "ALTER TABLE terminal_disposition_intents ADD COLUMN task_db_path TEXT",
+    )
+    _add_registry_column(
+        conn,
+        intent_columns,
+        "owner_started_at",
+        "ALTER TABLE terminal_disposition_intents ADD COLUMN owner_started_at REAL",
     )
     return conn
 
@@ -313,6 +365,10 @@ def list_workspace_records(
     board_id: Optional[str] = None,
     repo_path: Optional[Path | str] = None,
 ) -> list[WorkspaceRecord]:
+    # Any registry read is also a recovery boundary. This keeps inventory and
+    # the fail-closed janitor from silently observing a terminal task without
+    # first reconciling its durable disposition intent.
+    recover_terminal_disposition_intents(board_id=board_id, task_id=task_id)
     clauses: list[str] = []
     params: list[object] = []
     if task_id is not None:
@@ -978,17 +1034,432 @@ def prepare_terminal_disposition(
     return plans
 
 
-def attach_registry(conn: sqlite3.Connection) -> None:
-    """Attach the initialized registry so task + lifecycle writes share a txn."""
-    path = registry_path().expanduser().resolve(strict=False)
-    with contextlib.closing(connect_registry()):
-        pass
+def _intent_rows(
+    conn: sqlite3.Connection,
+    *,
+    operation_id: Optional[str] = None,
+    board_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> list[sqlite3.Row]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if operation_id is not None:
+        clauses.append("operation_id = ?")
+        params.append(operation_id)
+    if board_id is not None:
+        clauses.append("board_id = ?")
+        params.append(board_id)
+    if task_id is not None:
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    return conn.execute(
+        "SELECT * FROM terminal_disposition_intents"
+        + where
+        + " ORDER BY operation_id, workspace_id",
+        tuple(params),
+    ).fetchall()
+
+
+def abort_terminal_disposition_intent(operation_id: str) -> int:
+    """Restore staged rows after the task transaction definitely rolled back."""
+    with contextlib.closing(connect_registry()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = _intent_rows(conn, operation_id=operation_id)
+            for row in rows:
+                restored = conn.execute(
+                    "UPDATE workspaces SET status = ? WHERE workspace_id = ? "
+                    "AND board_id = ? AND task_id = ? AND repo_id = ? "
+                    "AND workspace_path = ? AND status = 'terminalizing'",
+                    (
+                        row["expected_status"],
+                        row["workspace_id"],
+                        row["board_id"],
+                        row["task_id"],
+                        row["expected_repo_id"],
+                        row["expected_workspace_path"],
+                    ),
+                )
+                if restored.rowcount != 1:
+                    raise RuntimeError(
+                        f"workspace {row['workspace_id']} changed while aborting "
+                        "terminal disposition"
+                    )
+            cur = conn.execute(
+                "DELETE FROM terminal_disposition_intents WHERE operation_id = ?",
+                (operation_id,),
+            )
+            if cur.rowcount != len(rows):
+                raise RuntimeError(
+                    f"terminal intent {operation_id} changed while aborting"
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return cur.rowcount
+
+
+def stage_terminal_disposition_intent(
+    plans: list[_TerminalDispositionPlan],
+    *,
+    terminal_status: str,
+    task_db_path: Path | str,
+) -> Optional[str]:
+    """Durably classify workspaces before the WAL task commit can begin.
+
+    The intent lives entirely in the shared registry database, so its commit is
+    crash-atomic without relying on SQLite multi-database ATTACH semantics.
+    Recovery later decides whether to finalize or abort it from the task DB's
+    durable status.
+    """
+    if not plans:
+        return None
+    if terminal_status not in {"done", "archived"}:
+        raise ValueError(f"unsupported terminal intent status: {terminal_status}")
+    ownership = {
+        (plan.record.board_id, plan.record.task_id) for plan in plans
+    }
+    if len(ownership) != 1:
+        raise RuntimeError("terminal disposition plans must share one board and task")
+    board_id, task_id = next(iter(ownership))
+    if not board_id or not task_id:
+        raise RuntimeError("terminal disposition plans require board and task ownership")
+    canonical_task_db_path = _canonical(task_db_path)
+
+    # Resolve any prior crash before reserving these workspace ids. A live
+    # concurrent operation remains pending under its PID/lease and therefore
+    # keeps the UNIQUE(workspace_id) guard fail-closed.
+    recover_terminal_disposition_intents(board_id=board_id, task_id=task_id)
+
+    operation_id = "td_" + uuid.uuid4().hex
+    now = int(time.time())
+    owner_host = socket.gethostname() or "unknown"
+    owner_pid = os.getpid()
+    try:
+        owner_started_at: Optional[float] = float(
+            psutil.Process(owner_pid).create_time()
+        )
+    except Exception:
+        # Missing liveness evidence must fail closed during recovery. psutil is
+        # a core dependency, but preserving an intent is safer than guessing.
+        owner_started_at = None
+    expires_at = now + TERMINAL_INTENT_LEASE_SECONDS
+    with contextlib.closing(connect_registry()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for plan in plans:
+                record = plan.record
+                current = conn.execute(
+                    "SELECT repo_id, workspace_path, board_id, task_id, status "
+                    "FROM workspaces WHERE workspace_id = ?",
+                    (record.workspace_id,),
+                ).fetchone()
+                expected = (
+                    record.repo_id,
+                    record.workspace_path,
+                    record.board_id,
+                    record.task_id,
+                    record.status,
+                )
+                if current is None or tuple(current) != expected:
+                    raise RuntimeError(
+                        f"workspace {record.workspace_id} changed while staging "
+                        "terminal disposition"
+                    )
+                staged = conn.execute(
+                    "UPDATE workspaces SET status = 'terminalizing' "
+                    "WHERE workspace_id = ? AND board_id = ? AND task_id = ? "
+                    "AND repo_id = ? AND workspace_path = ? AND status = ?",
+                    (
+                        record.workspace_id,
+                        record.board_id,
+                        record.task_id,
+                        record.repo_id,
+                        record.workspace_path,
+                        record.status,
+                    ),
+                )
+                if staged.rowcount != 1:
+                    raise RuntimeError(
+                        f"workspace {record.workspace_id} changed while staging "
+                        "terminal disposition"
+                    )
+                conn.execute(
+                    "INSERT INTO terminal_disposition_intents ("
+                    "operation_id, workspace_id, board_id, task_id, terminal_status, "
+                    "task_db_path, "
+                    "expected_repo_id, expected_workspace_path, expected_status, "
+                    "disposition, target_status, dirty_manifest_hash, "
+                    "exception_policy_id, exception_expires_at, retention_condition, "
+                    "head_sha, branch, pr_numbers, estimated_bytes, verified_at, "
+                    "owner_host, owner_pid, owner_started_at, expires_at, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        operation_id,
+                        record.workspace_id,
+                        board_id,
+                        task_id,
+                        terminal_status,
+                        canonical_task_db_path,
+                        record.repo_id,
+                        record.workspace_path,
+                        record.status,
+                        plan.disposition,
+                        plan.status,
+                        plan.dirty_manifest_hash,
+                        plan.exception_policy_id,
+                        plan.exception_expires_at,
+                        plan.retention_condition,
+                        plan.head_sha,
+                        plan.branch,
+                        ",".join(str(number) for number in plan.pr_numbers),
+                        plan.estimated_bytes,
+                        plan.verified_at,
+                        owner_host,
+                        owner_pid,
+                        owner_started_at,
+                        expires_at,
+                        now,
+                    ),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return operation_id
+
+
+def _intent_owner_is_alive(row: sqlite3.Row) -> Optional[bool]:
+    if str(row["owner_host"]) != (socket.gethostname() or "unknown"):
+        return None
+    try:
+        process = psutil.Process(int(row["owner_pid"]))
+        if process.status() == psutil.STATUS_ZOMBIE:
+            return False
+        expected_started_at = row["owner_started_at"]
+        if expected_started_at is None:
+            return None
+        return abs(process.create_time() - float(expected_started_at)) <= 0.01
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+    except Exception:
+        # Unknown liveness remains pending and fail-closed. A lease timestamp is
+        # audit evidence, not permission to abort a possibly live transition.
+        return None
+
+
+def finalize_terminal_disposition_intent(
+    operation_id: str,
+    *,
+    abort_nonterminal: bool = True,
+) -> str:
+    """Resolve one intent to ``finalized``, ``aborted``, or ``pending``."""
+    with contextlib.closing(connect_registry()) as registry:
+        rows = _intent_rows(registry, operation_id=operation_id)
+    if not rows:
+        return "absent"
+    identities = {
+        (
+            str(row["board_id"]),
+            str(row["task_id"]),
+            str(row["terminal_status"]),
+            str(row["task_db_path"] or ""),
+        )
+        for row in rows
+    }
+    if len(identities) != 1:
+        raise RuntimeError(f"terminal intent {operation_id} has mixed ownership")
+    board_id, task_id, _terminal_status, task_db_path = next(iter(identities))
+    if not task_db_path or not Path(task_db_path).is_file():
+        # Never let recovery create or guess a board DB. The exact path is part
+        # of the durable intent because ambient HERMES_KANBAN_DB can override
+        # even an explicit board selector.
+        return "pending"
+
+    from hermes_cli import kanban_db
+
+    try:
+        with kanban_db.connect_closing(
+            db_path=Path(task_db_path), board=board_id
+        ) as task_conn:
+            task_row = task_conn.execute(
+                "SELECT status, terminal_disposition_operation_id "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot reconcile terminal intent {operation_id} against board {board_id}"
+        ) from exc
+    if task_row is None:
+        # Missing task evidence is ambiguous and must remain fail-closed.
+        return "pending"
+
+    task_committed_this_intent = (
+        str(task_row["status"]) == _terminal_status
+        and task_row["terminal_disposition_operation_id"] == operation_id
+    )
+    if not task_committed_this_intent:
+        owner_alive = _intent_owner_is_alive(rows[0])
+        if abort_nonterminal or owner_alive is False:
+            abort_terminal_disposition_intent(operation_id)
+            return "aborted"
+        return "pending"
+
+    # The task commit is durable. Finalize every registry row plus intent
+    # deletion in one single-database transaction. A crash during this COMMIT
+    # therefore leaves either the complete intent or the complete disposition.
+    with contextlib.closing(connect_registry()) as registry:
+        registry.execute("BEGIN IMMEDIATE")
+        try:
+            current_rows = _intent_rows(registry, operation_id=operation_id)
+            if not current_rows:
+                # Another recovery boundary resolved the complete operation
+                # while this caller was reading task evidence. Intent deletion
+                # is atomic with disposition finalization/abort, so an empty
+                # re-read is an idempotent already-resolved outcome.
+                registry.execute("COMMIT")
+                return "absent"
+            if len(current_rows) != len(rows):
+                raise RuntimeError(
+                    f"terminal intent {operation_id} changed during recovery"
+                )
+            for row in current_rows:
+                cur = registry.execute(
+                    "UPDATE workspaces SET disposition = ?, status = ?, "
+                    "dirty_manifest_hash = ?, exception_policy_id = ?, "
+                    "exception_expires_at = ?, retention_condition = ?, head_sha = ?, "
+                    "branch = ?, pr_numbers = ?, estimated_bytes = ?, last_used_at = ?, "
+                    "last_verified_at = ? WHERE workspace_id = ? AND board_id = ? "
+                    "AND task_id = ? AND repo_id = ? AND workspace_path = ? "
+                    "AND status = 'terminalizing'",
+                    (
+                        row["disposition"],
+                        row["target_status"],
+                        row["dirty_manifest_hash"],
+                        row["exception_policy_id"],
+                        row["exception_expires_at"],
+                        row["retention_condition"],
+                        row["head_sha"],
+                        row["branch"],
+                        row["pr_numbers"],
+                        row["estimated_bytes"],
+                        row["verified_at"],
+                        row["verified_at"],
+                        row["workspace_id"],
+                        row["board_id"],
+                        row["task_id"],
+                        row["expected_repo_id"],
+                        row["expected_workspace_path"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        f"workspace {row['workspace_id']} changed during terminal recovery"
+                    )
+            deleted = registry.execute(
+                "DELETE FROM terminal_disposition_intents WHERE operation_id = ?",
+                (operation_id,),
+            )
+            if deleted.rowcount != len(current_rows):
+                raise RuntimeError(
+                    f"terminal intent {operation_id} changed before deletion"
+                )
+            registry.execute("COMMIT")
+        except Exception:
+            registry.execute("ROLLBACK")
+            raise
+    return "finalized"
+
+
+def recover_terminal_disposition_intents(
+    *,
+    board_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> dict[str, list[str]]:
+    """Deterministically reconcile crash-left terminal disposition intents."""
+    with contextlib.closing(connect_registry()) as registry:
+        rows = _intent_rows(registry, board_id=board_id, task_id=task_id)
+    operation_ids = sorted({str(row["operation_id"]) for row in rows})
+    report: dict[str, list[str]] = {
+        "finalized": [],
+        "aborted": [],
+        "pending": [],
+    }
+    for operation_id in operation_ids:
+        outcome = finalize_terminal_disposition_intent(
+            operation_id, abort_nonterminal=False
+        )
+        if outcome in report:
+            report[outcome].append(operation_id)
+    return report
+
+
+@contextlib.contextmanager
+def terminal_task_transaction(
+    conn: sqlite3.Connection,
+    plans: list[_TerminalDispositionPlan],
+    *,
+    terminal_status: str,
+):
+    """Wrap a task write transaction in the durable intent protocol."""
+    from hermes_cli import kanban_db
+
+    task_db_path = ""
     for row in conn.execute("PRAGMA database_list").fetchall():
-        if str(row[1]) == "workspace_registry":
-            if Path(str(row[2])).expanduser().resolve(strict=False) != path:
-                raise RuntimeError("a different workspace registry is already attached")
-            return
-    conn.execute("ATTACH DATABASE ? AS workspace_registry", (str(path),))
+        if str(row[1]) == "main":
+            task_db_path = str(row[2] or "")
+            break
+    if plans and not task_db_path:
+        raise RuntimeError("terminal disposition requires a file-backed task database")
+    operation_id = stage_terminal_disposition_intent(
+        plans,
+        terminal_status=terminal_status,
+        task_db_path=task_db_path,
+    )
+    try:
+        with kanban_db.write_txn(conn):
+            yield operation_id
+    except BaseException:
+        # write_txn handles ordinary Exception, but BaseException subclasses
+        # such as KeyboardInterrupt/SystemExit bypass its rollback handler.
+        # Never reconcile registry evidence while uncommitted task changes are
+        # still visible on this connection.
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                _log.exception(
+                    "task transaction for terminal intent %s could not roll back",
+                    operation_id,
+                )
+        if operation_id is not None and not conn.in_transaction:
+            try:
+                # Inspect durable task state rather than assuming COMMIT failed;
+                # write_txn can surface a post-commit invariant error.
+                finalize_terminal_disposition_intent(operation_id)
+            except Exception:
+                _log.exception(
+                    "terminal intent %s remains for deterministic recovery",
+                    operation_id,
+                )
+        elif operation_id is not None:
+            _log.error(
+                "terminal intent %s remains pending because task transaction "
+                "state is uncertain",
+                operation_id,
+            )
+        raise
+    else:
+        if operation_id is not None:
+            outcome = finalize_terminal_disposition_intent(operation_id)
+            if outcome == "pending":
+                raise RuntimeError(
+                    f"terminal intent {operation_id} could not be reconciled"
+                )
 
 
 def _apply_terminal_plans(
@@ -1030,14 +1501,6 @@ def _apply_terminal_plans(
             raise RuntimeError(
                 f"workspace {plan.record.workspace_id} changed during terminal transition"
             )
-
-
-def apply_terminal_disposition_in_transaction(
-    conn: sqlite3.Connection,
-    plans: list[_TerminalDispositionPlan],
-) -> None:
-    """Apply prepared plans on an already-open task transaction."""
-    _apply_terminal_plans(conn, plans, table="workspace_registry.workspaces")
 
 
 def apply_terminal_disposition(
@@ -1367,6 +1830,11 @@ def reconcile_inventory(
             for record in records:
                 if record.workspace_path not in physical_paths:
                     continue
+                if record.status == "terminalizing":
+                    # The durable intent owns this row until task-state recovery
+                    # atomically finalizes or restores it. Inventory must not
+                    # race that compare-and-swap snapshot.
+                    continue
                 task = tasks.get((record.board_id or "default", record.task_id or ""))
                 task_status = getattr(task, "status", None)
                 status_raw = _git(
@@ -1390,6 +1858,12 @@ def reconcile_inventory(
                 )
                 if is_protected:
                     lifecycle_status = "protected"
+                elif record.status == "retirement_queued":
+                    # This status is durable disposition state, not a fresh
+                    # cleanliness observation. Janitor independently rechecks
+                    # task terminality, dirt, PRs, and dependencies, so keep
+                    # the queue classification while those gates fail closed.
+                    lifecycle_status = "retirement_queued"
                 elif task_status in terminal_statuses:
                     lifecycle_status = "terminal_dirty" if is_dirty else "terminal_clean"
                     if not record.disposition:
@@ -1411,7 +1885,7 @@ def reconcile_inventory(
                 conn.execute(
                     "UPDATE workspaces SET branch = COALESCE(?, branch), head_sha = ?, "
                     "status = ?, dirty_manifest_hash = ?, estimated_bytes = ?, "
-                    "last_verified_at = ? WHERE workspace_id = ?",
+                    "last_verified_at = ? WHERE workspace_id = ? AND status = ?",
                     (
                         record.branch if preserve_terminal_snapshot else branch,
                         record.head_sha if preserve_terminal_snapshot else head,
@@ -1424,6 +1898,7 @@ def reconcile_inventory(
                         size,
                         now,
                         record.workspace_id,
+                        record.status,
                     ),
                 )
             conn.execute("COMMIT")
@@ -1584,6 +2059,11 @@ def plan_janitor(
         task = tasks.get((record.board_id or "default", record.task_id or ""))
         if getattr(task, "status", None) not in terminal_task_statuses:
             reasons.append("task_not_terminal")
+        if record.status == "terminalizing":
+            # A retained-until-janitor disposition can be an old snapshot while
+            # a newer terminal transition owns the row. Never treat that stale
+            # disposition as deletion authority while recovery is pending.
+            reasons.append("terminal_disposition_pending")
         if record.workspace_path not in physical:
             reasons.append("missing_from_git_inventory")
         else:

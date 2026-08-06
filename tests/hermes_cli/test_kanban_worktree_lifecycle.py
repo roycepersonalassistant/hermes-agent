@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
+import sqlite3
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -364,6 +367,503 @@ def test_complete_and_archive_require_explicit_workspace_disposition(
         assert clean_record.status == "retirement_queued"
 
 
+def test_terminal_disposition_recovers_after_process_dies_between_commits(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "crash-recovery"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="crash during terminalization",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/crash-recovery",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+    source_root = Path(__file__).parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(source_root), env.get("PYTHONPATH", "")])
+    )
+    script = f"""
+import os
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_workspaces as kw
+
+def die_after_task_commit(operation_id):
+    os._exit(91)
+
+kw.finalize_terminal_disposition_intent = die_after_task_commit
+with kb.connect() as conn:
+    kb.complete_task(
+        conn,
+        {task_id!r},
+        metadata={{"workspace_disposition": "retained_until:crash-review"}},
+    )
+raise SystemExit(92)
+"""
+    interrupted = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=source_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert interrupted.returncode == 91, interrupted.stderr
+
+    with kb.connect() as conn:
+        recovered_task = kb.get_task(conn, task_id)
+        assert recovered_task is not None
+        assert recovered_task.status == "done"
+    with sqlite3.connect(kw.registry_path()) as registry:
+        workspace = registry.execute(
+            "SELECT status, disposition FROM workspaces WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        pending = registry.execute(
+            "SELECT COUNT(*) FROM terminal_disposition_intents WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+    assert workspace == ("terminalizing", None)
+    assert pending == 1
+
+    report = kw.recover_terminal_disposition_intents(
+        board_id="default", task_id=task_id
+    )
+    assert len(report["finalized"]) == 1
+    assert report["aborted"] == []
+    assert report["pending"] == []
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "terminal_clean"
+    assert record.disposition == "retained_until:crash-review"
+    with sqlite3.connect(kw.registry_path()) as registry:
+        assert registry.execute(
+            "SELECT COUNT(*) FROM terminal_disposition_intents WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_terminal_disposition_aborts_after_process_dies_before_task_commit(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "crash-before-task-commit"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="crash before task commit",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/crash-before-task-commit",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+    source_root = Path(__file__).parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(source_root), env.get("PYTHONPATH", "")])
+    )
+    script = f"""
+import os
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_workspaces as kw
+
+original_stage = kw.stage_terminal_disposition_intent
+
+def die_after_intent_commit(*args, **kwargs):
+    operation_id = original_stage(*args, **kwargs)
+    assert operation_id is not None
+    os._exit(93)
+
+kw.stage_terminal_disposition_intent = die_after_intent_commit
+with kb.connect() as conn:
+    kb.complete_task(
+        conn,
+        {task_id!r},
+        metadata={{"workspace_disposition": "retained_until:crash-review"}},
+    )
+raise SystemExit(94)
+"""
+    interrupted = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=source_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert interrupted.returncode == 93, interrupted.stderr
+
+    with kb.connect() as conn:
+        interrupted_task = conn.execute(
+            "SELECT status, terminal_disposition_operation_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert tuple(interrupted_task) == ("ready", None)
+    with sqlite3.connect(kw.registry_path()) as registry:
+        workspace = registry.execute(
+            "SELECT status, disposition FROM workspaces WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        pending = registry.execute(
+            "SELECT COUNT(*) FROM terminal_disposition_intents WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+    assert workspace == ("terminalizing", None)
+    assert pending == 1
+
+    report = kw.recover_terminal_disposition_intents(
+        board_id="default", task_id=task_id
+    )
+    assert report["finalized"] == []
+    assert len(report["aborted"]) == 1
+    assert report["pending"] == []
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "active"
+    assert record.disposition is None
+    with sqlite3.connect(kw.registry_path()) as registry:
+        assert registry.execute(
+            "SELECT COUNT(*) FROM terminal_disposition_intents WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_live_intent_is_not_aborted_when_lease_timestamp_expires(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "live-terminal-intent"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="live terminal intent",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/live-terminal-intent",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+    plans = kw.prepare_terminal_disposition(
+        task_id=task_id,
+        board_id="default",
+        disposition="retained_until:review",
+    )
+    operation_id = kw.stage_terminal_disposition_intent(
+        plans,
+        terminal_status="done",
+        task_db_path=kb.kanban_db_path(),
+    )
+    assert operation_id is not None
+    with sqlite3.connect(kw.registry_path()) as registry:
+        registry.execute(
+            "UPDATE terminal_disposition_intents SET expires_at = 1 "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        )
+
+    report = kw.recover_terminal_disposition_intents(
+        board_id="default", task_id=task_id
+    )
+    assert report["pending"] == [operation_id]
+    assert kw.list_workspace_records(task_id=task_id)[0].status == "terminalizing"
+    assert kw.abort_terminal_disposition_intent(operation_id) == 1
+
+
+def test_recovery_rejects_reused_owner_pid(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "reused-owner-pid"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reused owner pid",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/reused-owner-pid",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+    plans = kw.prepare_terminal_disposition(
+        task_id=task_id,
+        board_id="default",
+        disposition="retained_until:review",
+    )
+    operation_id = kw.stage_terminal_disposition_intent(
+        plans,
+        terminal_status="done",
+        task_db_path=kb.kanban_db_path(),
+    )
+    assert operation_id is not None
+    with sqlite3.connect(kw.registry_path()) as registry:
+        registry.execute(
+            "UPDATE terminal_disposition_intents SET owner_started_at = 0 "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        )
+
+    report = kw.recover_terminal_disposition_intents(
+        board_id="default", task_id=task_id
+    )
+    assert report["finalized"] == []
+    assert report["aborted"] == [operation_id]
+    assert report["pending"] == []
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "active"
+    assert record.disposition is None
+
+
+def test_inventory_cas_does_not_overwrite_new_terminalizing_marker(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "inventory-terminal-race"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="inventory terminal race",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/inventory-terminal-race",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+    plans = kw.prepare_terminal_disposition(
+        task_id=task_id,
+        board_id="default",
+        disposition="retained_until:review",
+    )
+    original_connect_registry = kw.connect_registry
+    calls = 0
+    staged_operation_id: str | None = None
+
+    def racing_connect_registry():
+        nonlocal calls, staged_operation_id
+        calls += 1
+        if calls == 3:
+            staged_operation_id = kw.stage_terminal_disposition_intent(
+                plans,
+                terminal_status="done",
+                task_db_path=kb.kanban_db_path(),
+            )
+        return original_connect_registry()
+
+    monkeypatch.setattr(kw, "connect_registry", racing_connect_registry)
+    kw.reconcile_inventory(
+        repo_paths=[repo],
+        approved_roots=[repo / ".worktrees"],
+    )
+
+    assert staged_operation_id is not None
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "terminalizing"
+    with sqlite3.connect(kw.registry_path()) as registry:
+        assert registry.execute(
+            "SELECT COUNT(*) FROM terminal_disposition_intents "
+            "WHERE operation_id = ?",
+            (staged_operation_id,),
+        ).fetchone()[0] == 1
+    assert kw.abort_terminal_disposition_intent(staged_operation_id) == 1
+
+
+def test_recovery_aborts_intent_not_correlated_to_task_commit(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "mismatched-terminal-intent"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="mismatched terminal intent",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/mismatched-terminal-intent",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+        assert kb.complete_task(
+            conn,
+            task_id,
+            metadata={"workspace_disposition": "retained_until:done-review"},
+        )
+
+    plans = kw.prepare_terminal_disposition(
+        task_id=task_id,
+        board_id="default",
+        disposition="retained_until:archive-review",
+    )
+    operation_id = kw.stage_terminal_disposition_intent(
+        plans,
+        terminal_status="archived",
+        task_db_path=kb.kanban_db_path(),
+    )
+    assert operation_id is not None
+    monkeypatch.setattr(kw, "_intent_owner_is_alive", lambda _row: False)
+
+    report = kw.recover_terminal_disposition_intents(
+        board_id="default", task_id=task_id
+    )
+    assert report["finalized"] == []
+    assert report["aborted"] == [operation_id]
+    assert report["pending"] == []
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "terminal_clean"
+    assert record.disposition == "retained_until:done-review"
+
+
+def test_concurrent_terminal_recovery_is_idempotent(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "concurrent-recovery"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="concurrent recovery",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/concurrent-recovery",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+    plans = kw.prepare_terminal_disposition(
+        task_id=task_id,
+        board_id="default",
+        disposition="retained_until:review",
+    )
+    operation_id = kw.stage_terminal_disposition_intent(
+        plans,
+        terminal_status="done",
+        task_db_path=kb.kanban_db_path(),
+    )
+    assert operation_id is not None
+    with kb.connect() as conn, kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'done', "
+            "terminal_disposition_operation_id = ? WHERE id = ?",
+            (operation_id, task_id),
+        )
+
+    original_connect_registry = kw.connect_registry
+    calls = 0
+
+    def racing_connect_registry():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            monkeypatch.setattr(kw, "connect_registry", original_connect_registry)
+            try:
+                assert kw.finalize_terminal_disposition_intent(operation_id) == "finalized"
+            finally:
+                monkeypatch.setattr(kw, "connect_registry", racing_connect_registry)
+        return original_connect_registry()
+
+    monkeypatch.setattr(kw, "connect_registry", racing_connect_registry)
+    assert kw.finalize_terminal_disposition_intent(operation_id) == "absent"
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "terminal_clean"
+    assert record.disposition == "retained_until:review"
+
+
+def test_terminal_disposition_intent_is_aborted_when_task_transaction_rolls_back(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "exception-rollback"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="rollback terminalization",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/exception-rollback",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+        def fail_closing_run(*args, **kwargs):
+            raise RuntimeError("injected task transaction failure")
+
+        monkeypatch.setattr(kb, "_end_run", fail_closing_run)
+        with pytest.raises(RuntimeError, match="injected task transaction failure"):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={"workspace_disposition": "retained_until:review"},
+            )
+        rolled_back_task = kb.get_task(conn, task_id)
+        assert rolled_back_task is not None
+        assert rolled_back_task.status == "ready"
+
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "active"
+    assert record.disposition is None
+    with sqlite3.connect(kw.registry_path()) as registry:
+        assert registry.execute(
+            "SELECT COUNT(*) FROM terminal_disposition_intents WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_terminal_disposition_rolls_back_base_exception(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "base-exception-rollback"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="base exception rollback",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/base-exception-rollback",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+        def interrupt_closing_run(*args, **kwargs):
+            raise KeyboardInterrupt("injected task transaction interrupt")
+
+        monkeypatch.setattr(kb, "_end_run", interrupt_closing_run)
+        with pytest.raises(KeyboardInterrupt, match="injected task transaction interrupt"):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={"workspace_disposition": "retained_until:review"},
+            )
+        assert not conn.in_transaction
+        rolled_back_task = kb.get_task(conn, task_id)
+        assert rolled_back_task is not None
+        assert rolled_back_task.status == "ready"
+
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "active"
+    assert record.disposition is None
+    with sqlite3.connect(kw.registry_path()) as registry:
+        assert registry.execute(
+            "SELECT COUNT(*) FROM terminal_disposition_intents WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
 def test_terminal_disposition_uses_the_connection_board_not_ambient_board(
     kanban_home, tmp_path, monkeypatch
 ):
@@ -393,6 +893,73 @@ def test_terminal_disposition_uses_the_connection_board_not_ambient_board(
     assert record.board_id == "beta"
     assert record.disposition == "retained_until:beta-review"
     assert record.status == "terminal_clean"
+
+
+def test_terminal_recovery_uses_persisted_db_path_not_ambient_override(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "beta-recovery"
+    kb.create_board("beta")
+    beta_db_path = kb.board_dir("beta") / "kanban.db"
+    original_finalize = kw.finalize_terminal_disposition_intent
+
+    def leave_committed_intent(_operation_id, **_kwargs):
+        raise RuntimeError("injected post-commit recovery interruption")
+
+    monkeypatch.setattr(
+        kw, "finalize_terminal_disposition_intent", leave_committed_intent
+    )
+    with kb.connect(board="beta") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="beta recovery",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/beta-recovery",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task, board="beta")
+        with pytest.raises(
+            RuntimeError, match="injected post-commit recovery interruption"
+        ):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={"workspace_disposition": "retained_until:beta-review"},
+            )
+        committed_task = conn.execute(
+            "SELECT status, terminal_disposition_operation_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert committed_task[0] == "done"
+        assert committed_task[1] is not None
+
+    monkeypatch.setattr(
+        kw, "finalize_terminal_disposition_intent", original_finalize
+    )
+    with sqlite3.connect(kw.registry_path()) as registry:
+        intent_db_path = registry.execute(
+            "SELECT task_db_path FROM terminal_disposition_intents WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+    assert Path(intent_db_path) == beta_db_path.resolve()
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_home / "kanban.db"))
+    report = kw.recover_terminal_disposition_intents(
+        board_id="beta", task_id=task_id
+    )
+    assert len(report["finalized"]) == 1
+    assert report["aborted"] == []
+    assert report["pending"] == []
+    record = kw.list_workspace_records(board_id="beta", task_id=task_id)[0]
+    assert record.status == "terminal_clean"
+    assert record.disposition == "retained_until:beta-review"
+    with kb.connect(db_path=beta_db_path, board="beta") as conn:
+        recovered_task = kb.get_task(conn, task_id)
+        assert recovered_task is not None
+        assert recovered_task.status == "done"
 
 
 def test_archive_cli_records_direct_disposition_and_reuses_completed_one(
@@ -671,6 +1238,56 @@ def test_janitor_is_dry_run_only_and_excludes_unsafe_worktrees(
         )
     )
     assert cli_plan == plan
+
+
+def test_janitor_excludes_workspace_with_live_terminal_intent(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    approved = repo / ".worktrees"
+    target = approved / "terminalizing-janitor"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="terminalizing janitor safety",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/terminalizing-janitor",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+        assert kb.complete_task(
+            conn,
+            task_id,
+            metadata={"workspace_disposition": "retained_until:janitor"},
+        )
+
+    plans = kw.prepare_terminal_disposition(
+        task_id=task_id,
+        board_id="default",
+        disposition=None,
+    )
+    operation_id = kw.stage_terminal_disposition_intent(
+        plans,
+        terminal_status="archived",
+        task_db_path=kb.kanban_db_path(),
+    )
+    assert operation_id is not None
+
+    plan = kw.plan_janitor(repo_paths=[repo], approved_roots=[approved])
+    assert plan["candidates"] == []
+    excluded = plan["excluded"]
+    assert isinstance(excluded, list)
+    exclusion = next(
+        item
+        for item in excluded
+        if item["workspace_path"] == str(target.resolve())
+    )
+    assert "terminal_disposition_pending" in exclusion["reasons"]
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "terminalizing"
+    assert kw.abort_terminal_disposition_intent(operation_id) == 1
 
 
 def test_janitor_never_candidates_primary_or_locked_worktrees(
@@ -1153,7 +1770,7 @@ def test_stale_completion_cannot_commit_workspace_disposition(
     assert record.disposition is None
 
 
-def test_registry_failure_rolls_back_task_terminal_transition(
+def test_registry_intent_stage_failure_leaves_task_nonterminal(
     tmp_path, kanban_home, monkeypatch
 ):
     import importlib
@@ -1173,14 +1790,13 @@ def test_registry_failure_rolls_back_task_terminal_transition(
         assert task is not None
         kb.resolve_workspace(task)
 
-        def fail_registry_update(*_args, **_kwargs):
+        def fail_registry_stage(*_args, **_kwargs):
             raise RuntimeError("injected registry failure")
 
         monkeypatch.setattr(
             live_kw,
-            "apply_terminal_disposition_in_transaction",
-            fail_registry_update,
-            raising=False,
+            "stage_terminal_disposition_intent",
+            fail_registry_stage,
         )
         with pytest.raises(RuntimeError, match="injected registry failure"):
             kb.complete_task(
@@ -1188,7 +1804,9 @@ def test_registry_failure_rolls_back_task_terminal_transition(
                 task_id,
                 metadata={"workspace_disposition": "retained_until:review"},
             )
-        assert kb.get_task(conn, task_id).status == "ready"
+        unchanged_task = kb.get_task(conn, task_id)
+        assert unchanged_task is not None
+        assert unchanged_task.status == "ready"
 
     record = kw.list_workspace_records(task_id=task_id)[0]
     assert record.status == "active"
