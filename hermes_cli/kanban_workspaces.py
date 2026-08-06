@@ -1295,7 +1295,14 @@ def finalize_terminal_disposition_intent(
             f"cannot reconcile terminal intent {operation_id} against board {board_id}"
         ) from exc
     if task_row is None:
-        # Missing task evidence is ambiguous and must remain fail-closed.
+        # The exact task DB is part of the intent, so a missing row means the
+        # terminal transition did not survive (or an explicit delete won the
+        # race). Abort only when this caller knows the task txn failed or the
+        # original process is dead; a live owner remains pending fail-closed.
+        owner_alive = _intent_owner_is_alive(rows[0])
+        if abort_nonterminal or owner_alive is False:
+            abort_terminal_disposition_intent(operation_id)
+            return "aborted"
         return "pending"
 
     task_committed_this_intent = (
@@ -1396,6 +1403,17 @@ def recover_terminal_disposition_intents(
         if outcome in report:
             report[outcome].append(operation_id)
     return report
+
+
+def has_terminal_disposition_intents(*, board_id: str, task_id: str) -> bool:
+    """Return whether deletion must preserve task evidence for recovery."""
+    with contextlib.closing(connect_registry()) as registry:
+        row = registry.execute(
+            "SELECT 1 FROM terminal_disposition_intents "
+            "WHERE board_id = ? AND task_id = ? LIMIT 1",
+            (board_id, task_id),
+        ).fetchone()
+    return row is not None
 
 
 @contextlib.contextmanager

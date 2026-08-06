@@ -6479,7 +6479,24 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     tasks must be explicitly archived first so accidental data loss requires a
     second deliberate action.
     """
+    from hermes_cli import kanban_workspaces as _workspaces
+
+    board_id = _board_for_connection(conn)
+    _workspaces.recover_terminal_disposition_intents(
+        board_id=board_id, task_id=task_id
+    )
+    if _workspaces.has_terminal_disposition_intents(
+        board_id=board_id, task_id=task_id
+    ):
+        return False
     with write_txn(conn):
+        # Close the preflight race: an operation may stage its registry intent
+        # while this task writer waits for BEGIN IMMEDIATE. Never delete the
+        # durable task evidence while any such intent remains unresolved.
+        if _workspaces.has_terminal_disposition_intents(
+            board_id=board_id, task_id=task_id
+        ):
+            return False
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -6506,9 +6523,23 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     This keeps the operation atomic (single ``write_txn``).
 
     Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
+    if the task was not found or terminal-disposition recovery is pending.
     """
+    from hermes_cli import kanban_workspaces as _workspaces
+
+    board_id = _board_for_connection(conn)
+    _workspaces.recover_terminal_disposition_intents(
+        board_id=board_id, task_id=task_id
+    )
+    if _workspaces.has_terminal_disposition_intents(
+        board_id=board_id, task_id=task_id
+    ):
+        return False
     with write_txn(conn):
+        if _workspaces.has_terminal_disposition_intents(
+            board_id=board_id, task_id=task_id
+        ):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

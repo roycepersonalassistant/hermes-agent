@@ -962,6 +962,106 @@ def test_terminal_recovery_uses_persisted_db_path_not_ambient_override(
         assert recovered_task.status == "done"
 
 
+def test_delete_archived_task_recovers_committed_terminal_intent(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "delete-archived-recovery"
+    original_finalize = kw.finalize_terminal_disposition_intent
+
+    def leave_committed_intent(_operation_id, **_kwargs):
+        raise RuntimeError("injected post-archive recovery interruption")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="delete archived recovery",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/delete-archived-recovery",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+        monkeypatch.setattr(
+            kw, "finalize_terminal_disposition_intent", leave_committed_intent
+        )
+        with pytest.raises(
+            RuntimeError, match="injected post-archive recovery interruption"
+        ):
+            kb.archive_task(
+                conn,
+                task_id,
+                workspace_disposition="retained_until:review",
+            )
+        archived_task = kb.get_task(conn, task_id)
+        assert archived_task is not None
+        assert archived_task.status == "archived"
+
+        monkeypatch.setattr(
+            kw, "finalize_terminal_disposition_intent", original_finalize
+        )
+        assert kb.delete_archived_task(conn, task_id)
+        assert kb.get_task(conn, task_id) is None
+
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "terminal_clean"
+    assert record.disposition == "retained_until:review"
+    assert not kw.has_terminal_disposition_intents(
+        board_id="default", task_id=task_id
+    )
+
+
+def test_delete_task_refuses_live_intent_then_recovers_dead_owner(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "delete-live-intent"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="delete live intent",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/delete-live-intent",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+    plans = kw.prepare_terminal_disposition(
+        task_id=task_id,
+        board_id="default",
+        disposition="retained_until:review",
+    )
+    operation_id = kw.stage_terminal_disposition_intent(
+        plans,
+        terminal_status="done",
+        task_db_path=kb.kanban_db_path(),
+    )
+    assert operation_id is not None
+    with kb.connect() as conn:
+        assert not kb.delete_task(conn, task_id)
+        assert kb.get_task(conn, task_id) is not None
+    assert kw.list_workspace_records(task_id=task_id)[0].status == "terminalizing"
+
+    with sqlite3.connect(kw.registry_path()) as registry:
+        registry.execute(
+            "UPDATE terminal_disposition_intents SET owner_started_at = 0 "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        )
+    with kb.connect() as conn:
+        assert kb.delete_task(conn, task_id)
+        assert kb.get_task(conn, task_id) is None
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.status == "active"
+    assert record.disposition is None
+    assert not kw.has_terminal_disposition_intents(
+        board_id="default", task_id=task_id
+    )
+
+
 def test_archive_cli_records_direct_disposition_and_reuses_completed_one(
     kanban_home, tmp_path
 ):
