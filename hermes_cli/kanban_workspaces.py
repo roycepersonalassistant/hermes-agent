@@ -846,9 +846,27 @@ def _validate_recovery_detail(record: WorkspaceRecord, detail: str) -> None:
     artifact_path = Path(artifact).expanduser()
     if not artifact_path.is_absolute():
         artifact_path = Path(record.workspace_path) / artifact_path
-    if not artifact_path.exists():
+    workspace_path = Path(record.workspace_path).expanduser()
+    try:
+        artifact_lexical = Path(os.path.abspath(artifact_path))
+        workspace_lexical = Path(os.path.abspath(workspace_path))
+        artifact_resolved = artifact_path.resolve(strict=True)
+        workspace_resolved = workspace_path.resolve(strict=False)
+        inside_workspace = (
+            artifact_lexical.is_relative_to(workspace_lexical)
+            or artifact_resolved.is_relative_to(workspace_resolved)
+        )
+    except (OSError, RuntimeError):
+        inside_workspace = True
+    if (
+        inside_workspace
+        or artifact_path.is_symlink()
+        or not artifact_path.is_file()
+    ):
         raise RuntimeError(
-            f"preserved_dirty recovery artifact does not exist: {artifact_path}"
+            "preserved_dirty recovery artifact must be an independently durable "
+            f"regular file outside disposable worktree {record.workspace_path}: "
+            f"{artifact_path}"
         )
 
 
@@ -950,26 +968,87 @@ def prepare_terminal_disposition(
     for record in owned:
         raw_text = str(by_id[record.workspace_id]).strip()
         kind, detail = _parse_disposition(raw_text)
-        status_raw = _git(
-            record.workspace_path,
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-        )
         exists = Path(record.workspace_path).exists()
-        is_dirty = bool(status_raw)
-        if kind == "retired" and exists:
-            if is_dirty:
-                raise RuntimeError(
-                    f"dirty worktree {record.workspace_path} cannot be marked retired; "
-                    "use preserved_dirty with a recovery artifact and owner, or remove "
-                    "it safely first"
+        if kind == "retired":
+            if exists:
+                status_raw = _git(
+                    record.workspace_path,
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
                 )
-            raise RuntimeError(
-                f"worktree {record.workspace_path} still exists and cannot be marked "
-                "retired; use retained_until:<condition> or remove it safely first"
+                if status_raw is None:
+                    raise RuntimeError(
+                        f"could not verify Git status for {record.workspace_path}; "
+                        "refusing terminal disposition"
+                    )
+                if bool(status_raw):
+                    raise RuntimeError(
+                        f"dirty worktree {record.workspace_path} cannot be marked retired; "
+                        "use preserved_dirty with a recovery artifact and owner, or remove "
+                        "it safely first"
+                    )
+                raise RuntimeError(
+                    f"worktree {record.workspace_path} still exists and cannot be marked "
+                    "retired; use retained_until:<condition> or remove it safely first"
+                )
+            worktree_list = _git(record.repo_path, "worktree", "list", "--porcelain")
+            if worktree_list is None:
+                raise RuntimeError(
+                    f"could not verify Git worktree registration for {record.repo_path}; "
+                    f"refusing to retire {record.workspace_path}"
+                )
+            registered_paths = {
+                _canonical(line.removeprefix("worktree "))
+                for line in worktree_list.splitlines()
+                if line.startswith("worktree ")
+            }
+            if _canonical(record.workspace_path) in registered_paths:
+                raise RuntimeError(
+                    f"worktree {record.workspace_path} is absent on disk but still "
+                    "registered by Git; remove the registration safely before marking retired"
+                )
+            status_raw = ""
+            head_sha = record.head_sha
+            branch = record.branch
+            workspace_bytes = record.estimated_bytes
+        else:
+            if not exists:
+                raise RuntimeError(
+                    f"could not verify Git status for missing workspace "
+                    f"{record.workspace_path}; only a Git-confirmed retired disposition is valid"
+                )
+            status_raw = _git(
+                record.workspace_path,
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
             )
+            if status_raw is None:
+                raise RuntimeError(
+                    f"could not verify Git status for {record.workspace_path}; "
+                    "refusing terminal disposition"
+                )
+            head_sha = _git(record.workspace_path, "rev-parse", "HEAD")
+            if head_sha is None:
+                raise RuntimeError(
+                    f"could not verify Git head for {record.workspace_path}; "
+                    "refusing terminal disposition"
+                )
+            branch_raw = _git(
+                record.workspace_path, "rev-parse", "--abbrev-ref", "HEAD"
+            )
+            if branch_raw is None:
+                raise RuntimeError(
+                    f"could not verify Git branch for {record.workspace_path}; "
+                    "refusing terminal disposition"
+                )
+            branch = None if branch_raw == "HEAD" else branch_raw
+            workspace_bytes = estimated_bytes(record.workspace_path)
+
+        is_dirty = bool(status_raw)
         if kind == "preserved_dirty" and not is_dirty:
             raise RuntimeError(
                 f"workspace {record.workspace_path} is clean; preserved_dirty would be "
@@ -1019,11 +1098,9 @@ def prepare_terminal_disposition(
                     else record.exception_policy_id
                 ),
                 retention_condition=retention_condition,
-                head_sha=_git(record.workspace_path, "rev-parse", "HEAD"),
-                branch=(
-                    _git(record.workspace_path, "branch", "--show-current") or None
-                ),
-                estimated_bytes=estimated_bytes(record.workspace_path),
+                head_sha=head_sha,
+                branch=branch,
+                estimated_bytes=workspace_bytes,
                 pr_numbers=(
                     normalized_prs if normalized_prs is not None else record.pr_numbers
                 ),
@@ -1414,6 +1491,35 @@ def has_terminal_disposition_intents(*, board_id: str, task_id: str) -> bool:
             (board_id, task_id),
         ).fetchone()
     return row is not None
+
+
+@contextlib.contextmanager
+def task_evidence_deletion_guard(*, board_id: str, task_id: str):
+    """Serialize hard deletion against lifecycle registration and intents.
+
+    The registry write lock is held across the caller's task-DB transaction, so
+    a new workspace row or terminal intent cannot appear between validation and
+    task deletion. ``True`` means durable task evidence is still required.
+    """
+    with contextlib.closing(connect_registry()) as registry:
+        registry.execute("BEGIN IMMEDIATE")
+        try:
+            intent = registry.execute(
+                "SELECT 1 FROM terminal_disposition_intents "
+                "WHERE board_id = ? AND task_id = ? LIMIT 1",
+                (board_id, task_id),
+            ).fetchone()
+            workspace = registry.execute(
+                "SELECT 1 FROM workspaces WHERE board_id = ? AND task_id = ? "
+                "AND status NOT IN ('retired', 'creation_failed') LIMIT 1",
+                (board_id, task_id),
+            ).fetchone()
+            yield intent is not None or workspace is not None
+            registry.execute("COMMIT")
+        except BaseException:
+            if registry.in_transaction:
+                registry.execute("ROLLBACK")
+            raise
 
 
 @contextlib.contextmanager

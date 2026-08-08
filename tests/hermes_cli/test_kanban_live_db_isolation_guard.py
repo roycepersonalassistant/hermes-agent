@@ -30,6 +30,9 @@ class TestProductionKanbanPathRefused:
         production_root = operator_home / ".hermes"
         production_db = production_root / "kanban.db"
         monkeypatch.setenv("HOME", str(operator_home))
+        monkeypatch.setattr(
+            kanban_db, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (production_root,)
+        )
 
         with pytest.raises(RuntimeError, match="live-system guard"):
             kanban_db.connect(db_path=production_db)
@@ -49,6 +52,9 @@ class TestProductionKanbanPathRefused:
             / "kanban.db"
         )
         monkeypatch.setenv("HOME", str(operator_home))
+        monkeypatch.setattr(
+            kanban_db, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (production_root,)
+        )
 
         with pytest.raises(RuntimeError, match="live-system guard"):
             kanban_db.connect(db_path=production_db)
@@ -69,6 +75,9 @@ class TestProductionKanbanPathRefused:
             / "kanban.db"
         )
         monkeypatch.setenv("HOME", str(operator_home))
+        monkeypatch.setattr(
+            kanban_db, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (production_root,)
+        )
         monkeypatch.setenv("HERMES_KANBAN_DB", str(production_db))
         monkeypatch.setenv(
             "HERMES_KANBAN_WORKSPACES_ROOT",
@@ -82,6 +91,67 @@ class TestProductionKanbanPathRefused:
             kanban_db.connect()
 
         assert not production_root.exists()
+
+
+    def test_arbitrary_inherited_db_pin_is_an_exact_denied_target(
+        self, tmp_path, monkeypatch
+    ):
+        inherited_db = tmp_path / "portable-live-board" / "custom.sqlite3"
+        monkeypatch.setenv("_HERMES_TEST_KANBAN_DENY_DBS", str(inherited_db))
+
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            kanban_db._ensure_test_isolation(inherited_db)
+
+        assert not inherited_db.parent.exists()
+
+    def test_lexical_production_path_is_blocked_when_symlink_resolves_outward(
+        self, tmp_path, monkeypatch
+    ):
+        production_root = tmp_path / "operator-home" / ".hermes"
+        outside = tmp_path / "outside"
+        (outside / "kanban" / "boards" / "portfolio").mkdir(parents=True)
+        production_root.mkdir(parents=True)
+        (production_root / "kanban").symlink_to(
+            outside / "kanban", target_is_directory=True
+        )
+        candidate = production_root / "kanban" / "boards" / "portfolio" / "kanban.db"
+        monkeypatch.setattr(
+            kanban_db, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (production_root,)
+        )
+
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            kanban_db._ensure_test_isolation(candidate)
+
+        assert not candidate.exists()
+
+    def test_internal_pytest_bridge_survives_scrubbed_pytest_variables(
+        self, tmp_path, monkeypatch
+    ):
+        production_root = tmp_path / "immutable-production"
+        production_db = production_root / "kanban.db"
+        monkeypatch.setattr(
+            kanban_db, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (production_root,)
+        )
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.delenv("PYTEST_VERSION", raising=False)
+        monkeypatch.setenv("_HERMES_TEST_KANBAN_GUARD_ACTIVE", "1")
+
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            kanban_db._ensure_test_isolation(production_db)
+
+    def test_mutating_home_to_temp_does_not_create_a_false_production_root(
+        self, tmp_path, monkeypatch
+    ):
+        immutable_root = tmp_path / "actual-production"
+        monkeypatch.setattr(
+            kanban_db, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (immutable_root,)
+        )
+        temp_home = tmp_path / "test-home"
+        monkeypatch.setenv("HOME", str(temp_home))
+        temp_db = temp_home / ".hermes" / "kanban.db"
+
+        kanban_db._ensure_test_isolation(temp_db)
+        assert not temp_db.exists()
 
 
 class TestHermeticKanbanPathAllowed:
@@ -115,14 +185,30 @@ class TestHermeticKanbanPathAllowed:
 
 
 class TestBypassMarker:
-    @pytest.mark.live_system_guard_bypass
-    def test_bypass_marker_disables_kanban_guard(self, tmp_path, monkeypatch):
+    @pytest.mark.kanban_live_db_guard_bypass
+    def test_dedicated_bypass_marker_disables_only_kanban_guard(
+        self, tmp_path, monkeypatch
+    ):
         operator_home = tmp_path / "operator-home"
         production_db = operator_home / ".hermes" / "kanban.db"
         monkeypatch.setenv("HOME", str(operator_home))
 
         # Drive the guard directly; never open the production-shaped DB.
         kanban_db._ensure_test_isolation(production_db)
+        assert not production_db.exists()
+
+    @pytest.mark.live_system_guard_bypass
+    def test_broad_live_system_bypass_does_not_disable_kanban_guard(
+        self, tmp_path, monkeypatch
+    ):
+        production_root = tmp_path / "operator-home" / ".hermes"
+        production_db = production_root / "kanban.db"
+        monkeypatch.setattr(
+            kanban_db, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (production_root,)
+        )
+
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            kanban_db._ensure_test_isolation(production_db)
         assert not production_db.exists()
 
 

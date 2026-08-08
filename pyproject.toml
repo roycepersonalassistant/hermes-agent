@@ -417,6 +417,7 @@ markers = [
     "real_agent_prewarm: opt out of the autouse stub that disables the tui_gateway deferred agent pre-warm timer",
     "requires_wal: needs the runtime to actually enable SQLite WAL mode (skipped where Hermes falls back to journal_mode=DELETE)",
     "no_isolate: opt out of per-file subprocess isolation (tests share mutable module-level state)",
+    "kanban_live_db_guard_bypass: explicitly bypass only the Kanban live-DB guard for a dedicated safety test",
     "ssh: marks tests requiring a reachable SSH server (skipped in normal CI)",
 ]
 # integration tests take way too long to run in the normal CI environments

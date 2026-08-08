@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_workspaces as kw
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,37 @@ def client(kanban_home):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
     return TestClient(app)
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(cwd),
+            "-c",
+            "user.name=Dashboard Test",
+            "-c",
+            "user.email=dashboard@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _make_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "init")
+    return repo
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +291,80 @@ def test_reopening_parent_demotes_ready_child(client):
         f"/api/plugins/kanban/tasks/{child['id']}"
     ).json()["task"]
     assert child_after_reopen["status"] == "todo"
+
+
+def test_archive_endpoint_accepts_and_applies_workspace_disposition(
+    client, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "dashboard-archive"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="dashboard archive",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/dashboard-archive",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={
+            "status": "archived",
+            "workspace_disposition": "retained_until:dashboard-review",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "archived"
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.disposition == "retained_until:dashboard-review"
+    assert record.status == "terminal_clean"
+
+
+def test_archive_endpoint_translates_lifecycle_failure_to_actionable_409(
+    client, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "dashboard-missing-disposition"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="dashboard missing disposition",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/dashboard-missing-disposition",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}", json={"status": "archived"}
+    )
+
+    assert response.status_code == 409
+    assert "workspace_disposition" in response.json()["detail"]
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "ready"
+
+
+def test_archive_endpoint_rejects_invalid_workspace_disposition_shape(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "invalid disposition"}
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "archived", "workspace_disposition": ["retired"]},
+    )
+
+    assert response.status_code == 422
 
 
 # ---------------------------------------------------------------------------

@@ -57,7 +57,9 @@ if str(PROJECT_ROOT) not in sys.path:
 # otherwise the deny-list would point at the throwaway tempdir and the guard
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+_PRE_SANDBOX_KANBAN_DB = os.environ.get("HERMES_KANBAN_DB", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+_PRE_SANDBOX_REAL_HOME = Path.home().resolve()
 
 
 def _hermes_home_points_at_production(value: str) -> bool:
@@ -612,23 +614,35 @@ def _capture_real_kanban_root() -> Path:
         # root matters).
         from hermes_constants import get_default_hermes_root
         return get_default_hermes_root().resolve()
-    # No pre-existing HERMES_HOME: the real root is the platform default,
-    # NOT the sandbox tempdir now sitting in the env.
-    return (Path.home() / ".hermes").resolve()
+    # No pre-existing HERMES_HOME: the real root is the platform default as it
+    # existed before tests could mutate HOME.
+    return (_PRE_SANDBOX_REAL_HOME / ".hermes").resolve()
 
 
 _REAL_KANBAN_ROOT = _capture_real_kanban_root()
 _KANBAN_TEST_DENY_ROOTS_ENV = "_HERMES_TEST_KANBAN_DENY_ROOTS"
+_KANBAN_TEST_DENY_DBS_ENV = "_HERMES_TEST_KANBAN_DENY_DBS"
 _KANBAN_TEST_BYPASS_ENV = "_HERMES_TEST_KANBAN_GUARD_BYPASS"
+_KANBAN_TEST_ACTIVE_ENV = "_HERMES_TEST_KANBAN_GUARD_ACTIVE"
 # Set at collection time so even subprocesses started before function-scoped
-# fixtures inherit the custom/portable production root deny-list.
+# fixtures inherit immutable production roots, exact DB pins, and activation.
 os.environ[_KANBAN_TEST_DENY_ROOTS_ENV] = str(_REAL_KANBAN_ROOT)
+os.environ[_KANBAN_TEST_ACTIVE_ENV] = "1"
+if _PRE_SANDBOX_KANBAN_DB:
+    os.environ[_KANBAN_TEST_DENY_DBS_ENV] = _PRE_SANDBOX_KANBAN_DB
 
 
 @pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, request, monkeypatch):
     monkeypatch.setenv(_KANBAN_TEST_DENY_ROOTS_ENV, str(_REAL_KANBAN_ROOT))
-    bypassed = request.node.get_closest_marker("live_system_guard_bypass") is not None
+    monkeypatch.setenv(_KANBAN_TEST_ACTIVE_ENV, "1")
+    if _PRE_SANDBOX_KANBAN_DB:
+        monkeypatch.setenv(_KANBAN_TEST_DENY_DBS_ENV, _PRE_SANDBOX_KANBAN_DB)
+    else:
+        monkeypatch.delenv(_KANBAN_TEST_DENY_DBS_ENV, raising=False)
+    bypassed = (
+        request.node.get_closest_marker("kanban_live_db_guard_bypass") is not None
+    )
     if bypassed:
         monkeypatch.setenv(_KANBAN_TEST_BYPASS_ENV, "1")
     else:
@@ -643,6 +657,11 @@ def _kanban_write_guard(_hermetic_environment, request, monkeypatch):
         return
     monkeypatch.setattr(
         _kdb, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (_REAL_KANBAN_ROOT,)
+    )
+    monkeypatch.setattr(
+        _kdb,
+        "_KANBAN_DB_GUARD_EXTRA_DENY_DBS",
+        ((Path(_PRE_SANDBOX_KANBAN_DB),) if _PRE_SANDBOX_KANBAN_DB else ()),
     )
     yield
 

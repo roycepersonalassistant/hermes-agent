@@ -836,6 +836,9 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    # Required when archiving a task that owns a registered worktree. A string
+    # applies to every owned workspace; a mapping must cover each workspace id.
+    workspace_disposition: Optional[str | dict[str, str]] = None
     # Per-task model/provider override (the board's model dropdown).
     # ``model_override=""`` clears both. ``clear_model_override=True`` is
     # the explicit clear signal — needed because Optional[str]=None means
@@ -895,7 +898,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # Direct status write for drag-drop (todo -> ready etc).
                     ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
+                try:
+                    ok = kanban_db.archive_task(
+                        conn,
+                        task_id,
+                        workspace_disposition=payload.workspace_disposition,
+                    )
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
             elif s == "running":
                 raise HTTPException(
                     status_code=400,

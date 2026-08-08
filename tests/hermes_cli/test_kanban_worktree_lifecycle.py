@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -306,6 +307,8 @@ def test_complete_and_archive_require_explicit_workspace_disposition(
         dirty_task = kb.get_task(conn, dirty_task_id)
         assert dirty_task is not None
         kb.resolve_workspace(dirty_task)
+        recovery_artifact = tmp_path / "dirty-recovery.patch"
+        recovery_artifact.write_text("durable recovery evidence\n", encoding="utf-8")
         (dirty_path / "evidence.txt").write_text("keep\n", encoding="utf-8")
 
         with pytest.raises(RuntimeError, match="workspace_disposition"):
@@ -333,13 +336,13 @@ def test_complete_and_archive_require_explicit_workspace_disposition(
             dirty_task_id,
             metadata={
                 "workspace_disposition": (
-                    "preserved_dirty:artifact=evidence.txt;owner=reviewer"
+                    f"preserved_dirty:artifact={recovery_artifact};owner=reviewer"
                 )
             },
         )
         dirty_record = kw.list_workspace_records(task_id=dirty_task_id)[0]
         assert dirty_record.disposition == (
-            "preserved_dirty:artifact=evidence.txt;owner=reviewer"
+            f"preserved_dirty:artifact={recovery_artifact};owner=reviewer"
         )
         assert dirty_record.status == "terminal_dirty"
         assert kb.archive_task(conn, dirty_task_id)
@@ -365,6 +368,123 @@ def test_complete_and_archive_require_explicit_workspace_disposition(
         clean_record = kw.list_workspace_records(task_id=clean_task_id)[0]
         assert clean_record.retention_condition == "janitor"
         assert clean_record.status == "retirement_queued"
+
+
+@pytest.mark.parametrize("failed_fact", ["status", "head", "branch"])
+def test_terminal_disposition_fails_closed_when_git_fact_is_unverifiable(
+    kanban_home, tmp_path, monkeypatch, failed_fact
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / f"unverifiable-{failed_fact}"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title=f"unverifiable {failed_fact}",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name=f"feat/unverifiable-{failed_fact}",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+        real_git = kw._git
+
+        def fail_selected_fact(path, *args):
+            if failed_fact == "status" and args and args[0] == "status":
+                return None
+            if failed_fact == "head" and args == ("rev-parse", "HEAD"):
+                return None
+            if failed_fact == "branch" and args in {
+                ("branch", "--show-current"),
+                ("rev-parse", "--abbrev-ref", "HEAD"),
+            }:
+                return None
+            return real_git(path, *args)
+
+        monkeypatch.setattr(kw, "_git", fail_selected_fact)
+        with pytest.raises(RuntimeError, match=rf"verify Git {failed_fact}"):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={"workspace_disposition": "retained_until:review"},
+            )
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_retired_disposition_rejects_stale_git_worktree_registration(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "stale-registration"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="stale registration",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/stale-registration",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+        # Simulate an unsafe filesystem-only removal. Git still owns an
+        # authoritative worktree registration for the now-absent path.
+        shutil.rmtree(target)
+        assert str(target.resolve()) in _git(repo, "worktree", "list", "--porcelain")
+
+        with pytest.raises(RuntimeError, match="still registered by Git"):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={"workspace_disposition": "retired"},
+            )
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+@pytest.mark.parametrize("artifact_kind", ["inside-worktree", "directory", "symlink"])
+def test_preserved_dirty_requires_independently_durable_regular_artifact(
+    kanban_home, tmp_path, artifact_kind
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / f"artifact-{artifact_kind}"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title=f"artifact {artifact_kind}",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name=f"feat/artifact-{artifact_kind}",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+        (target / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+        if artifact_kind == "inside-worktree":
+            artifact = target / "recovery.patch"
+            artifact.write_text("patch\n", encoding="utf-8")
+        elif artifact_kind == "directory":
+            artifact = tmp_path / "recovery-directory"
+            artifact.mkdir()
+        else:
+            durable = tmp_path / "durable.patch"
+            durable.write_text("patch\n", encoding="utf-8")
+            artifact = tmp_path / "recovery-link.patch"
+            artifact.symlink_to(durable)
+
+        with pytest.raises(RuntimeError, match="durable regular file outside"):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={
+                    "workspace_disposition": (
+                        f"preserved_dirty:artifact={artifact};owner=reviewer"
+                    )
+                },
+            )
+        assert kb.get_task(conn, task_id).status == "ready"
 
 
 def test_terminal_disposition_recovers_after_process_dies_between_commits(
@@ -1001,8 +1121,8 @@ def test_delete_archived_task_recovers_committed_terminal_intent(
         monkeypatch.setattr(
             kw, "finalize_terminal_disposition_intent", original_finalize
         )
-        assert kb.delete_archived_task(conn, task_id)
-        assert kb.get_task(conn, task_id) is None
+        assert not kb.delete_archived_task(conn, task_id)
+        assert kb.get_task(conn, task_id) is not None
 
     record = kw.list_workspace_records(task_id=task_id)[0]
     assert record.status == "terminal_clean"
@@ -1052,14 +1172,79 @@ def test_delete_task_refuses_live_intent_then_recovers_dead_owner(
             (operation_id,),
         )
     with kb.connect() as conn:
-        assert kb.delete_task(conn, task_id)
-        assert kb.get_task(conn, task_id) is None
+        assert not kb.delete_task(conn, task_id)
+        assert kb.get_task(conn, task_id) is not None
     record = kw.list_workspace_records(task_id=task_id)[0]
     assert record.status == "active"
     assert record.disposition is None
     assert not kw.has_terminal_disposition_intents(
         board_id="default", task_id=task_id
     )
+
+
+@pytest.mark.parametrize(
+    "lifecycle_status", ["active", "retained", "dirty", "retirement_queued"]
+)
+@pytest.mark.parametrize("delete_api", ["delete_task", "delete_archived_task"])
+def test_hard_delete_preserves_task_evidence_required_by_workspace_registry(
+    kanban_home, tmp_path, lifecycle_status, delete_api
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / f"delete-{delete_api}-{lifecycle_status}"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title=f"delete {delete_api} {lifecycle_status}",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name=f"feat/delete-{delete_api}-{lifecycle_status}",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+
+        if lifecycle_status == "retained":
+            assert kb.complete_task(
+                conn,
+                task_id,
+                metadata={"workspace_disposition": "retained_until:review"},
+            )
+        elif lifecycle_status == "dirty":
+            (target / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+            artifact = tmp_path / f"{task_id}-recovery.patch"
+            artifact.write_text("durable patch\n", encoding="utf-8")
+            assert kb.complete_task(
+                conn,
+                task_id,
+                metadata={
+                    "workspace_disposition": (
+                        f"preserved_dirty:artifact={artifact};owner=reviewer"
+                    )
+                },
+            )
+        elif lifecycle_status == "retirement_queued":
+            assert kb.complete_task(
+                conn,
+                task_id,
+                metadata={"workspace_disposition": "retained_until:janitor"},
+            )
+
+        if delete_api == "delete_archived_task":
+            conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (task_id,))
+            conn.commit()
+
+        assert not getattr(kb, delete_api)(conn, task_id)
+        assert kb.get_task(conn, task_id) is not None
+
+    records = kw.list_workspace_records(task_id=task_id)
+    assert len(records) == 1
+    expected = {
+        "active": "active",
+        "retained": "terminal_clean",
+        "dirty": "terminal_dirty",
+        "retirement_queued": "retirement_queued",
+    }[lifecycle_status]
+    assert records[0].status == expected
 
 
 def test_archive_cli_records_direct_disposition_and_reuses_completed_one(

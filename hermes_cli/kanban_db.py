@@ -411,18 +411,24 @@ _BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 # Keep the invariant at the DB choke point so a pytest-context process fails
 # before mkdir, SQLite open, journal pragmas, or schema writes.
 
-#: Escape hatch wired to ``@pytest.mark.live_system_guard_bypass`` by the
-#: repository conftest. Tests should almost never need this.
+#: Escape hatch wired only to ``@pytest.mark.kanban_live_db_guard_bypass``
+#: by the repository conftest. An unrelated live-system bypass must never
+#: disable Kanban protection.
 _KANBAN_DB_GUARD_BYPASS = False
 
 #: Additional production roots for custom/portable Hermes installations.
 #: The conftest captures these before sandboxing HERMES_HOME.
 _KANBAN_DB_GUARD_EXTRA_DENY_ROOTS: tuple[Path, ...] = ()
 
+#: Exact pre-sandbox DB pins that may live outside a conventional Hermes root.
+_KANBAN_DB_GUARD_EXTRA_DENY_DBS: tuple[Path, ...] = ()
+
 # Internal pytest-only environment bridge. Unlike module globals, these values
 # survive into ``python -c``/CLI children that never import tests/conftest.py.
 _KANBAN_DB_GUARD_DENY_ROOTS_ENV = "_HERMES_TEST_KANBAN_DENY_ROOTS"
+_KANBAN_DB_GUARD_DENY_DBS_ENV = "_HERMES_TEST_KANBAN_DENY_DBS"
 _KANBAN_DB_GUARD_BYPASS_ENV = "_HERMES_TEST_KANBAN_GUARD_BYPASS"
+_KANBAN_DB_GUARD_ACTIVE_ENV = "_HERMES_TEST_KANBAN_GUARD_ACTIVE"
 
 
 def _real_platform_kanban_root() -> Optional[Path]:
@@ -450,17 +456,28 @@ def _real_platform_kanban_root() -> Optional[Path]:
         return None
 
 
+# Capture once at import. Tests are allowed to mutate HOME, but that must not
+# redefine which operator root is production midway through a process.
+_KANBAN_DB_GUARD_PLATFORM_ROOT = _real_platform_kanban_root()
+
+
 def _running_under_pytest() -> bool:
-    """True in pytest itself and children that inherit pytest markers."""
+    """True in pytest itself and children carrying the internal bridge."""
     return bool(
-        os.environ.get("PYTEST_CURRENT_TEST")
+        os.environ.get(_KANBAN_DB_GUARD_ACTIVE_ENV) == "1"
+        or os.environ.get("PYTEST_CURRENT_TEST")
         or os.environ.get("PYTEST_VERSION")
     )
 
 
+def _lexical_path(value: Path | str) -> Path:
+    """Normalize without following symlinks, preserving lexical containment."""
+    return Path(os.path.abspath(os.path.expanduser(str(value))))
+
+
 def _production_kanban_roots() -> list[Path]:
     roots: list[Path] = []
-    real_root = _real_platform_kanban_root()
+    real_root = _KANBAN_DB_GUARD_PLATFORM_ROOT
     if real_root is not None:
         roots.append(real_root)
     for extra in _KANBAN_DB_GUARD_EXTRA_DENY_ROOTS:
@@ -480,12 +497,22 @@ def _production_kanban_roots() -> list[Path]:
     return roots
 
 
-def _is_production_kanban_db(resolved: Path, root: Path) -> bool:
-    """Return whether *resolved* is a default or named board under *root*."""
-    if resolved == root / "kanban.db":
+def _production_kanban_dbs() -> list[Path]:
+    dbs = [Path(path) for path in _KANBAN_DB_GUARD_EXTRA_DENY_DBS]
+    for raw in os.environ.get(_KANBAN_DB_GUARD_DENY_DBS_ENV, "").split(
+        os.pathsep
+    ):
+        if raw.strip():
+            dbs.append(Path(raw).expanduser())
+    return dbs
+
+
+def _is_production_kanban_db(candidate: Path, root: Path) -> bool:
+    """Return whether *candidate* is a default or named board under *root*."""
+    if candidate == root / "kanban.db":
         return True
     try:
-        parts = resolved.relative_to(root).parts
+        parts = candidate.relative_to(root).parts
     except ValueError:
         return False
     return (
@@ -503,22 +530,45 @@ def _ensure_test_isolation(db_path: Path) -> None:
     ) == "1"
     if bypassed or not _running_under_pytest():
         return
+
+    lexical = _lexical_path(db_path)
     try:
-        resolved = Path(db_path).expanduser().resolve()
-    except Exception:
-        return
+        resolved = lexical.resolve(strict=False)
+    except (OSError, RuntimeError):
+        resolved = lexical
+
+    for denied_db in _production_kanban_dbs():
+        denied_lexical = _lexical_path(denied_db)
+        try:
+            denied_resolved = denied_lexical.resolve(strict=False)
+        except (OSError, RuntimeError):
+            denied_resolved = denied_lexical
+        if lexical == denied_lexical or resolved == denied_resolved:
+            raise RuntimeError(
+                "live-system guard (kanban_write_guard): test attempted to open "
+                f"an inherited production kanban.db pin at {lexical}. Tests and "
+                "safety probes must redirect or clear every Kanban DB pin."
+            )
+
     for root in _production_kanban_roots():
-        if _is_production_kanban_db(resolved, root):
+        root_lexical = _lexical_path(root)
+        try:
+            root_resolved = root_lexical.resolve(strict=False)
+        except (OSError, RuntimeError):
+            root_resolved = root_lexical
+        if _is_production_kanban_db(
+            lexical, root_lexical
+        ) or _is_production_kanban_db(resolved, root_resolved):
             raise RuntimeError(
                 "live-system guard (kanban_write_guard): test attempted to open "
                 "production "
-                f"kanban.db at {resolved} (under real Hermes root {root}). "
+                f"kanban.db at {lexical} (under real Hermes root {root_lexical}). "
                 "Tests and safety probes must redirect every Kanban path: "
                 "use a temporary HERMES_HOME/HERMES_KANBAN_HOME, clear any "
                 "inherited HERMES_KANBAN_DB and HERMES_KANBAN_BOARD pins, "
                 "and place HERMES_KANBAN_WORKSPACES_ROOT in the same temporary "
                 "root. If this test genuinely needs the live board, mark it "
-                "with @pytest.mark.live_system_guard_bypass."
+                "with @pytest.mark.kanban_live_db_guard_bypass."
             )
 
 
@@ -6611,34 +6661,28 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     _workspaces.recover_terminal_disposition_intents(
         board_id=board_id, task_id=task_id
     )
-    if _workspaces.has_terminal_disposition_intents(
+    with _workspaces.task_evidence_deletion_guard(
         board_id=board_id, task_id=task_id
-    ):
-        return False
-    with write_txn(conn):
-        # Close the preflight race: an operation may stage its registry intent
-        # while this task writer waits for BEGIN IMMEDIATE. Never delete the
-        # durable task evidence while any such intent remains unresolved.
-        if _workspaces.has_terminal_disposition_intents(
-            board_id=board_id, task_id=task_id
-        ):
+    ) as evidence_required:
+        if evidence_required:
             return False
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row or row["status"] != "archived":
-            return False
-        conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
-        )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if not row or row["status"] != "archived":
+                return False
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+                (task_id, task_id),
+            )
+            conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+            cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            return cur.rowcount == 1
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -6657,23 +6701,20 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     _workspaces.recover_terminal_disposition_intents(
         board_id=board_id, task_id=task_id
     )
-    if _workspaces.has_terminal_disposition_intents(
+    with _workspaces.task_evidence_deletion_guard(
         board_id=board_id, task_id=task_id
-    ):
-        return False
-    with write_txn(conn):
-        if _workspaces.has_terminal_disposition_intents(
-            board_id=board_id, task_id=task_id
-        ):
+    ) as evidence_required:
+        if evidence_required:
             return False
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
-            return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        with write_txn(conn):
+            cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            if cur.rowcount != 1:
+                return False
+            conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+            conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
