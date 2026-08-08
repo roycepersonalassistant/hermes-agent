@@ -400,6 +400,128 @@ def scoped_current_board(slug: str):
 _BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 
 
+# ---------------------------------------------------------------------------
+# Live-board test-isolation guard
+# ---------------------------------------------------------------------------
+# A pytest fixture already clears inherited Kanban path pins and wraps
+# ``connect()``, but neither protection reaches subprocess children that do
+# not import the repository conftest. More importantly, a test/review probe
+# can redirect only HERMES_HOME while retaining HERMES_KANBAN_DB from its
+# parent worker; the explicit DB pin wins and silently targets the live board.
+# Keep the invariant at the DB choke point so a pytest-context process fails
+# before mkdir, SQLite open, journal pragmas, or schema writes.
+
+#: Escape hatch wired to ``@pytest.mark.live_system_guard_bypass`` by the
+#: repository conftest. Tests should almost never need this.
+_KANBAN_DB_GUARD_BYPASS = False
+
+#: Additional production roots for custom/portable Hermes installations.
+#: The conftest captures these before sandboxing HERMES_HOME.
+_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS: tuple[Path, ...] = ()
+
+# Internal pytest-only environment bridge. Unlike module globals, these values
+# survive into ``python -c``/CLI children that never import tests/conftest.py.
+_KANBAN_DB_GUARD_DENY_ROOTS_ENV = "_HERMES_TEST_KANBAN_DENY_ROOTS"
+_KANBAN_DB_GUARD_BYPASS_ENV = "_HERMES_TEST_KANBAN_GUARD_BYPASS"
+
+
+def _real_platform_kanban_root() -> Optional[Path]:
+    """Resolve the platform-default Hermes root without ``Path.home()``.
+
+    Tests frequently monkeypatch ``Path.home``. ``expanduser`` follows the
+    process HOME/passwd state instead, which is also inherited by subprocess
+    children and lets the guard identify their real platform root.
+    """
+    try:
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA", "").strip()
+            root = (
+                Path(base) / "hermes"
+                if base
+                else Path(os.path.expanduser("~"))
+                / "AppData"
+                / "Local"
+                / "hermes"
+            )
+        else:
+            root = Path(os.path.expanduser("~")) / ".hermes"
+        return root.resolve()
+    except Exception:
+        return None
+
+
+def _running_under_pytest() -> bool:
+    """True in pytest itself and children that inherit pytest markers."""
+    return bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("PYTEST_VERSION")
+    )
+
+
+def _production_kanban_roots() -> list[Path]:
+    roots: list[Path] = []
+    real_root = _real_platform_kanban_root()
+    if real_root is not None:
+        roots.append(real_root)
+    for extra in _KANBAN_DB_GUARD_EXTRA_DENY_ROOTS:
+        try:
+            roots.append(Path(extra).expanduser().resolve())
+        except Exception:
+            continue
+    for raw in os.environ.get(_KANBAN_DB_GUARD_DENY_ROOTS_ENV, "").split(
+        os.pathsep
+    ):
+        if not raw.strip():
+            continue
+        try:
+            roots.append(Path(raw).expanduser().resolve())
+        except Exception:
+            continue
+    return roots
+
+
+def _is_production_kanban_db(resolved: Path, root: Path) -> bool:
+    """Return whether *resolved* is a default or named board under *root*."""
+    if resolved == root / "kanban.db":
+        return True
+    try:
+        parts = resolved.relative_to(root).parts
+    except ValueError:
+        return False
+    return (
+        len(parts) == 4
+        and parts[0] == "kanban"
+        and parts[1] == "boards"
+        and parts[3] == "kanban.db"
+    )
+
+
+def _ensure_test_isolation(db_path: Path) -> None:
+    """Fail before a pytest-context process opens a production Kanban DB."""
+    bypassed = _KANBAN_DB_GUARD_BYPASS or os.environ.get(
+        _KANBAN_DB_GUARD_BYPASS_ENV
+    ) == "1"
+    if bypassed or not _running_under_pytest():
+        return
+    try:
+        resolved = Path(db_path).expanduser().resolve()
+    except Exception:
+        return
+    for root in _production_kanban_roots():
+        if _is_production_kanban_db(resolved, root):
+            raise RuntimeError(
+                "live-system guard (kanban_write_guard): test attempted to open "
+                "production "
+                f"kanban.db at {resolved} (under real Hermes root {root}). "
+                "Tests and safety probes must redirect every Kanban path: "
+                "use a temporary HERMES_HOME/HERMES_KANBAN_HOME, clear any "
+                "inherited HERMES_KANBAN_DB and HERMES_KANBAN_BOARD pins, "
+                "and place HERMES_KANBAN_WORKSPACES_ROOT in the same temporary "
+                "root. If this test genuinely needs the live board, mark it "
+                "with @pytest.mark.live_system_guard_bypass."
+            )
+
+
 def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
     """Lowercase + strip a slug; validate; return ``None`` for empty."""
     if slug is None:
@@ -1443,6 +1565,8 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     advisory locks on the database (see ``hermes_cli.sqlite_safe_read``).
     The registration is released automatically when the connection closes.
     """
+    _ensure_test_isolation(path)
+
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
@@ -2101,6 +2225,7 @@ def repair_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    _ensure_test_isolation(path)
     try:
         resolved = path.resolve()
     except OSError:
@@ -2186,6 +2311,7 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    _ensure_test_isolation(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     requested_board = _normalize_board_slug(board)
@@ -10272,6 +10398,7 @@ def count_notify_subs(
     (locked, corrupt); callers choose their own fallback.
     """
     path = db_path if db_path is not None else kanban_db_path(board=board)
+    _ensure_test_isolation(path)
     if not path.exists():
         return 0
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)

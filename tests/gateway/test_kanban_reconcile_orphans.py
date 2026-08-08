@@ -33,11 +33,17 @@ from hermes_cli import kanban_db as kb
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    db_path = home / "kanban.db"
+    workspaces = home / "kanban" / "workspaces"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspaces))
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    db_path = kb.kanban_db_path(board="default")
+    assert kb.kanban_db_path(board="default") == db_path
+    assert kb.workspaces_root(board="default") == workspaces
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     kb.init_db()
     return home
