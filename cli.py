@@ -658,6 +658,7 @@ def load_cli_config() -> Dict[str, Any]:
     
     env_mappings = {
         "env_type": "TERMINAL_ENV",
+        "degraded_mode": "TERMINAL_DEGRADED_MODE",
         "cwd": "TERMINAL_CWD",
         "timeout": "TERMINAL_TIMEOUT",
         "home_mode": "TERMINAL_HOME_MODE",
@@ -2981,6 +2982,25 @@ def _render_final_assistant_content(text: str, mode: str = "render"):
     return Markdown(plain)
 
 
+def _post_stream_transform_output(response: str, result: dict | None) -> str:
+    """Return text that still needs display after a streamed response transform.
+
+    A transform hook is allowed to replace the final response, not merely append
+    to it. When the transformed text retains the streamed response as a prefix,
+    printing only its suffix avoids duplicating the already-rendered body. A
+    replacement has no safe suffix, so deliberately print the complete final
+    response rather than silently dropping it.
+    """
+    if not result or not result.get("response_transformed"):
+        return ""
+
+    original = result.get("pre_transform_response") or ""
+    if original and response.startswith(original):
+        return response[len(original):]
+
+    return f"\n[Response transformed after streaming]\n{response}"
+
+
 _OUTPUT_HISTORY_ENABLED = True
 _OUTPUT_HISTORY_REPLAYING = False
 _OUTPUT_HISTORY_SUPPRESSED = False
@@ -4482,10 +4502,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
         
-        # Ephemeral system prompt: env var takes precedence, then config
+        # Ephemeral system prompt: env var takes precedence, then
+        # display.personality / agent.system_prompt from config.
+        from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
+
         self.system_prompt = (
             os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
-            or CLI_CONFIG["agent"].get("system_prompt", "")
+            or resolve_ephemeral_system_prompt_from_config(CLI_CONFIG)
         )
         self.personalities = CLI_CONFIG["agent"].get("personalities", {})
         
@@ -4723,6 +4746,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_tts_done.set()
         self._voice_tts_stop = None  # active streaming pipeline's stop event
         self._voice_barge_capture = threading.Event()  # barge monitor is capturing the interruption
+        self._voice_last_tts_text = ""  # most recently spoken TTS text (echo guard, #75780)
+        self._voice_barge_phase = None  # "generation" or "playback" phase of the last barge trip
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
@@ -8408,11 +8433,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         
         # Walk backwards to the last *real* user message. Timeline bookkeeping
         # rows (display_kind set) are role=user but are not user turns — match
-        # CLI resume counting and list_recent_user_messages.
+        # CLI resume counting and list_recent_user_messages. Compaction
+        # handoffs are excluded too (durable role=user, sometimes without
+        # display_kind on legacy sessions; #80622).
+        from agent.context_compressor import is_user_originated_turn
+
         last_user_idx = None
         for i in range(len(self.conversation_history) - 1, -1, -1):
             msg = self.conversation_history[i]
-            if msg.get("role") == "user" and not msg.get("display_kind"):
+            if is_user_originated_turn(msg):
                 last_user_idx = i
                 break
         
@@ -8458,12 +8487,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             n = 1
 
         # Walk backwards collecting the indices of the last N *real* user
-        # messages (exclude display_kind timeline rows — same predicate as
-        # list_recent_user_messages and resume turn counting).
+        # messages (exclude display_kind timeline rows and compaction
+        # handoffs — same predicate as list_recent_user_messages, resume
+        # turn counting, and /retry; #80622).
+        from agent.context_compressor import is_user_originated_turn
+
         user_indices = []
         for i in range(len(self.conversation_history) - 1, -1, -1):
             msg = self.conversation_history[i]
-            if msg.get("role") == "user" and not msg.get("display_kind"):
+            if is_user_originated_turn(msg):
                 user_indices.append(i)
                 if len(user_indices) >= n:
                     break
@@ -12546,14 +12578,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Strip markdown and non-speech content for cleaner TTS via the
             # shared cleaner (tools/tts_text_normalize): markdown, emoji,
-            # <think> blocks, verifier footer, units, newline flattening.
+            # ⋗ blocks, verifier footer, units, newline flattening.
+            # The TTS tool owns provider request limits and long-form chunking.
             try:
                 from tools.tts_text_normalize import prepare_spoken_text
-                tts_text = prepare_spoken_text(text, max_chars=4000)
+                tts_text = prepare_spoken_text(text, max_chars=None)
             except Exception:
                 # Legacy fallback pipeline — keep voice replies best-effort.
-                tts_text = text[:4000] if len(text) > 4000 else text
-                tts_text = re.sub(r'```[\s\S]*?```', ' ', tts_text)   # fenced code blocks
+                tts_text = re.sub(r'```[\s\S]*?```', ' ', text)   # fenced code blocks
                 tts_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', tts_text)  # [text](url) -> text
                 tts_text = re.sub(r'https?://\S+', '', tts_text)      # URLs
                 tts_text = re.sub(r'\*\*(.+?)\*\*', r'\1', tts_text)  # bold
@@ -12566,6 +12598,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 tts_text = tts_text.strip()
             if not tts_text:
                 return
+            self._voice_last_tts_text = tts_text
 
             # Use MP3 output for CLI playback (afplay doesn't handle OGG well).
             # The TTS tool may auto-convert MP3->OGG, but the original MP3 remains.
@@ -12581,26 +12614,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 tts_result = {}
 
-            # Prefer the requested MP3 when the provider produced it. This
-            # preserves reliable local playback while still supporting
-            # providers that write to and return a different path.
-            audio_path = mp3_path
-            if not os.path.isfile(mp3_path) or os.path.getsize(mp3_path) == 0:
-                audio_path = tts_result.get("file_path") or mp3_path
-
-            if os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0:
-                play_audio_file(audio_path)
-                # Clean up
-                try:
-                    cleanup_paths = {audio_path, mp3_path}
-                    for path in list(cleanup_paths):
-                        ogg_path = path.rsplit(".", 1)[0] + ".ogg"
-                        cleanup_paths.add(ogg_path)
-                    for path in cleanup_paths:
-                        if os.path.isfile(path):
-                            os.unlink(path)
-                except OSError:
-                    pass
+            # The tool result is authoritative — it may return multiple files
+            # for long-form chunked output. Play each in order.
+            play_paths = tts_result.get("file_paths") or [
+                tts_result.get("file_path") or mp3_path
+            ]
+            for play_path in play_paths if tts_result.get("success") else []:
+                if os.path.isfile(play_path) and os.path.getsize(play_path) > 0:
+                    play_audio_file(play_path)
+            # Clean up all generated files (play_paths + mp3_path + ogg variants)
+            cleanup_paths = set(play_paths + [mp3_path, mp3_path.rsplit(".", 1)[0] + ".ogg"])
+            for path in cleanup_paths:
+                if os.path.isfile(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
         except Exception as e:
             logger.warning("Voice TTS playback failed: %s", e)
             _cprint(f"{_DIM}TTS playback failed: {e}{_RST}")
@@ -12676,6 +12705,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Latch BEFORE cutting anything: suppresses process_loop's
                 # auto-restart until the capture is submitted.
                 self._voice_barge_capture.set()
+                self._voice_barge_phase = phase
                 if phase == "playback":
                     logger.debug(
                         "TTS CUT: full-duplex listener tripped during playback"
@@ -12733,6 +12763,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"\n{_DIM}Stop phrase detected — ending voice chat.{_RST}")
                     self._disable_voice_mode()
                     return
+                # Fail-closed echo guard (#75780): a playback-phase capture
+                # has no acoustic echo cancellation, so speaker bleed alone
+                # can trip the barge trigger. If the transcript is a close
+                # match for what Hermes just spoke, treat it as self-capture
+                # instead of queuing it as a user turn.
+                if getattr(self, "_voice_barge_phase", None) == "playback":
+                    from tools.voice_mode import is_tts_echo
+                    if is_tts_echo(transcript, getattr(self, "_voice_last_tts_text", "")):
+                        logger.debug(
+                            "Dropping playback-phase barge transcript as TTS echo: %r",
+                            transcript,
+                        )
+                        _cprint(f"\n{_DIM}Ignored likely TTS echo (not queued).{_RST}")
+                        return
                 self._pending_input.put(_VoiceInputMessage(transcript))
                 submitted = True
             elif not result.get("success"):
@@ -12746,6 +12790,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except OSError:
                 pass
             self._voice_barge_capture.clear()
+            self._voice_barge_phase = None
             # No usable transcript: hand the mic back to the normal loop.
             if not submitted and self._voice_mode and self._voice_continuous and not self._voice_recording:
                 self._voice_restart_recording_async()
@@ -13892,6 +13937,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # playback (speech cuts TTS), and disarms itself when the turn
             # is fully done. See _voice_full_duplex_listener.
             if self._voice_mode and self._voice_continuous:
+                self._voice_last_tts_text = ""
                 threading.Thread(
                     target=self._voice_full_duplex_listener, daemon=True
                 ).start()
@@ -13963,6 +14009,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 def stream_callback(delta: str):
                     if text_queue is not None:
                         text_queue.put(delta)
+                    # Track what's actually being spoken so a playback-phase
+                    # barge capture can be checked against it (echo guard,
+                    # #75780).
+                    self._voice_last_tts_text = (self._voice_last_tts_text or "") + delta
 
             # When voice mode is active, prepend a brief instruction so the
             # model responds concisely. The prefix is API-call-local only —
@@ -14413,7 +14463,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 elif already_streamed:
                     # Response was already streamed token-by-token with box framing;
                     # _flush_stream() already closed the box. Skip Rich Panel.
-                    pass
+                    # A transform hook runs after streaming. Show a suffix for
+                    # append-only changes, or the complete replacement otherwise.
+                    _post_stream_text = _post_stream_transform_output(response, result)
+                    if _post_stream_text.strip():
+                        _cprint(_post_stream_text)
                 else:
                     _chat_console = ChatConsole()
                     _chat_console.print(Panel(
@@ -15230,6 +15284,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_tts_done.set()  # Initially "done" (no TTS pending)
         self._voice_tts_stop = None  # active streaming pipeline's stop event
         self._voice_barge_capture = threading.Event()  # barge monitor is capturing the interruption
+        self._voice_last_tts_text = ""  # most recently spoken TTS text (echo guard, #75780)
+        self._voice_barge_phase = None  # "generation" or "playback" phase of the last barge trip
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()

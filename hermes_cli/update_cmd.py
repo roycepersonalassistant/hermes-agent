@@ -1258,7 +1258,15 @@ def _restore_stashed_changes(
         if input_fn is not None:
             response = input_fn("Restore local changes now? [Y/n]", "y")
         else:
-            response = input().strip().lower()
+            try:
+                response = input().strip().lower()
+            except (EOFError, UnicodeDecodeError):
+                # Mirror the config-migration prompt's fix: don't let a
+                # terminal-encoding issue or a closed stdin crash the
+                # update mid-restore. Falls through to the existing
+                # skip-restore path below, which already explains how to
+                # restore manually from git stash.
+                response = "n"
         if response not in {"", "y", "yes"}:
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
@@ -1545,7 +1553,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             response = (
                 input("Add official repo as 'upstream' remote? [Y/n]: ").strip().lower()
             )
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, UnicodeDecodeError):
             print()
             response = "n"
 
@@ -2692,12 +2700,9 @@ def _run_pre_update_backup(args) -> Optional[str]:
         size_bytes = 0
 
     # Human-readable size
-    size_str = f"{size_bytes} B"
-    for unit in ("KB", "MB", "GB"):
-        if size_bytes < 1024:
-            break
-        size_bytes /= 1024
-        size_str = f"{size_bytes:.1f} {unit}"
+    from hermes_cli.sizefmt import format_bytes
+
+    size_str = format_bytes(size_bytes)
 
     # Render path using display_hermes_home so the user sees ~/.hermes/...
     try:
@@ -4547,6 +4552,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         .lower()
                     )
                 except EOFError:
+                    response = "n"
+                except UnicodeDecodeError:
+                    # input() can raise this when the terminal encoding can't
+                    # decode the byte sequence (e.g. a non-UTF-8 locale, or an
+                    # embedded terminal). Without this, the exception escapes
+                    # here and crashes the update at this prompt.
+                    print(
+                        "  ⚠ Could not read input (encoding issue). Skipping. "
+                        "Run 'hermes config migrate' manually to configure."
+                    )
                     response = "n"
 
             if response in {"", "y", "yes", "auto"}:
