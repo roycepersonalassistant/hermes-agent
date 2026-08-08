@@ -21,6 +21,7 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import atexit
+import json
 import os
 import shutil
 import sqlite3
@@ -59,7 +60,10 @@ if str(PROJECT_ROOT) not in sys.path:
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_KANBAN_DB = os.environ.get("HERMES_KANBAN_DB", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
-_PRE_SANDBOX_REAL_HOME = Path.home().resolve()
+_PRE_SANDBOX_REAL_HOME_LEXICAL = Path(
+    os.path.abspath(os.path.expanduser("~"))
+)
+_PRE_SANDBOX_REAL_HOME = _PRE_SANDBOX_REAL_HOME_LEXICAL.resolve()
 
 
 def _hermes_home_points_at_production(value: str) -> bool:
@@ -593,7 +597,7 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
 
 
 def _capture_real_kanban_root() -> Path:
-    """Resolve the REAL kanban root from the pre-test environment.
+    """Capture the lexical REAL kanban root from the pre-test environment.
 
     Uses the pre-sandbox environment snapshot taken at the very top of this
     file (before the session HERMES_HOME sandbox rewired the env), so the
@@ -603,7 +607,7 @@ def _capture_real_kanban_root() -> Path:
     2. the real (pre-sandbox) Hermes root otherwise
     """
     if _PRE_SANDBOX_KANBAN_OVERRIDE:
-        return Path(_PRE_SANDBOX_KANBAN_OVERRIDE).expanduser().resolve()
+        return Path(os.path.abspath(os.path.expanduser(_PRE_SANDBOX_KANBAN_OVERRIDE)))
     if _PRE_SANDBOX_HERMES_HOME and not _hermes_home_points_at_production(
         _PRE_SANDBOX_HERMES_HOME
     ):
@@ -613,31 +617,50 @@ def _capture_real_kanban_root() -> Path:
         # honor it via the normal resolver (it may be a profile dir whose
         # root matters).
         from hermes_constants import get_default_hermes_root
-        return get_default_hermes_root().resolve()
+        return Path(os.path.abspath(str(get_default_hermes_root().expanduser())))
     # No pre-existing HERMES_HOME: the real root is the platform default as it
     # existed before tests could mutate HOME.
-    return (_PRE_SANDBOX_REAL_HOME / ".hermes").resolve()
+    return _PRE_SANDBOX_REAL_HOME_LEXICAL / ".hermes"
 
 
-_REAL_KANBAN_ROOT = _capture_real_kanban_root()
+def _guard_path_payload(path: Path | str) -> str:
+    lexical = Path(os.path.abspath(os.path.expanduser(str(path))))
+    return json.dumps(
+        [{"lexical": str(lexical), "resolved": str(lexical.resolve(strict=False))}],
+        separators=(",", ":"),
+    )
+
+
+_REAL_KANBAN_ROOT_LEXICAL = _capture_real_kanban_root()
+_REAL_KANBAN_ROOT = _REAL_KANBAN_ROOT_LEXICAL.resolve(strict=False)
 _KANBAN_TEST_DENY_ROOTS_ENV = "_HERMES_TEST_KANBAN_DENY_ROOTS"
 _KANBAN_TEST_DENY_DBS_ENV = "_HERMES_TEST_KANBAN_DENY_DBS"
 _KANBAN_TEST_BYPASS_ENV = "_HERMES_TEST_KANBAN_GUARD_BYPASS"
 _KANBAN_TEST_ACTIVE_ENV = "_HERMES_TEST_KANBAN_GUARD_ACTIVE"
 # Set at collection time so even subprocesses started before function-scoped
 # fixtures inherit immutable production roots, exact DB pins, and activation.
-os.environ[_KANBAN_TEST_DENY_ROOTS_ENV] = str(_REAL_KANBAN_ROOT)
+os.environ[_KANBAN_TEST_DENY_ROOTS_ENV] = _guard_path_payload(
+    _REAL_KANBAN_ROOT_LEXICAL
+)
 os.environ[_KANBAN_TEST_ACTIVE_ENV] = "1"
 if _PRE_SANDBOX_KANBAN_DB:
-    os.environ[_KANBAN_TEST_DENY_DBS_ENV] = _PRE_SANDBOX_KANBAN_DB
+    os.environ[_KANBAN_TEST_DENY_DBS_ENV] = _guard_path_payload(
+        _PRE_SANDBOX_KANBAN_DB
+    )
 
 
 @pytest.fixture(autouse=True)
 def _kanban_write_guard(_hermetic_environment, request, monkeypatch):
-    monkeypatch.setenv(_KANBAN_TEST_DENY_ROOTS_ENV, str(_REAL_KANBAN_ROOT))
+    monkeypatch.setenv(
+        _KANBAN_TEST_DENY_ROOTS_ENV,
+        _guard_path_payload(_REAL_KANBAN_ROOT_LEXICAL),
+    )
     monkeypatch.setenv(_KANBAN_TEST_ACTIVE_ENV, "1")
     if _PRE_SANDBOX_KANBAN_DB:
-        monkeypatch.setenv(_KANBAN_TEST_DENY_DBS_ENV, _PRE_SANDBOX_KANBAN_DB)
+        monkeypatch.setenv(
+            _KANBAN_TEST_DENY_DBS_ENV,
+            _guard_path_payload(_PRE_SANDBOX_KANBAN_DB),
+        )
     else:
         monkeypatch.delenv(_KANBAN_TEST_DENY_DBS_ENV, raising=False)
     bypassed = (
@@ -656,7 +679,9 @@ def _kanban_write_guard(_hermetic_environment, request, monkeypatch):
         yield
         return
     monkeypatch.setattr(
-        _kdb, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (_REAL_KANBAN_ROOT,)
+        _kdb,
+        "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS",
+        (_REAL_KANBAN_ROOT_LEXICAL, _REAL_KANBAN_ROOT),
     )
     monkeypatch.setattr(
         _kdb,

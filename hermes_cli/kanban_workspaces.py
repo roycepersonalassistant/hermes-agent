@@ -220,6 +220,19 @@ CREATE TABLE IF NOT EXISTS terminal_disposition_intents (
 );
 CREATE INDEX IF NOT EXISTS idx_terminal_disposition_intents_task
     ON terminal_disposition_intents(board_id, task_id, operation_id);
+CREATE TABLE IF NOT EXISTS task_lifecycle_fences (
+    board_id        TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    fence_kind      TEXT NOT NULL,
+    terminal_status TEXT,
+    task_db_path    TEXT NOT NULL,
+    operation_id    TEXT NOT NULL,
+    owner_host      TEXT NOT NULL,
+    owner_pid       INTEGER NOT NULL,
+    owner_started_at REAL,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (board_id, task_id)
+);
 """
 
 
@@ -460,6 +473,7 @@ def reserve_workspace(
     cleanup_policy: str = "on_task_terminal",
     retention_condition: Optional[str] = "task_terminal",
     replacement_reason: Optional[str] = None,
+    task_db_path: Optional[Path | str] = None,
 ) -> WorkspaceReservation:
     """Reserve ownership before ``git worktree add`` can mutate the repo.
 
@@ -511,6 +525,56 @@ def reserve_workspace(
     with contextlib.closing(connect_registry()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            fence = conn.execute(
+                "SELECT fence_kind FROM task_lifecycle_fences "
+                "WHERE board_id = ? AND task_id = ?",
+                (board_id, task_id),
+            ).fetchone()
+            if fence is not None:
+                raise RuntimeError(
+                    f"task {board_id}:{task_id} is fenced for "
+                    f"{fence['fence_kind']} and cannot register a workspace"
+                )
+            if task_db_path is not None:
+                exact_task_db = Path(_canonical(task_db_path))
+                if not exact_task_db.is_file():
+                    raise RuntimeError(
+                        f"cannot verify task {board_id}:{task_id}: "
+                        f"task database is unavailable at {exact_task_db}"
+                    )
+                task_conn: Optional[sqlite3.Connection] = None
+                try:
+                    task_conn = sqlite3.connect(
+                        str(exact_task_db), isolation_level=None, timeout=30
+                    )
+                    task_conn.row_factory = sqlite3.Row
+                    task_conn.execute("PRAGMA query_only=ON")
+                    task_row = task_conn.execute(
+                        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+                    ).fetchone()
+                except sqlite3.Error as exc:
+                    raise RuntimeError(
+                        f"cannot verify task {board_id}:{task_id} before "
+                        "workspace registration"
+                    ) from exc
+                finally:
+                    if task_conn is not None:
+                        task_conn.close()
+                if task_row is None:
+                    raise RuntimeError(
+                        f"task {board_id}:{task_id} no longer exists and cannot "
+                        "register a workspace"
+                    )
+                if str(task_row["status"]) not in {
+                    "todo",
+                    "ready",
+                    "running",
+                    "blocked",
+                }:
+                    raise RuntimeError(
+                        f"task {board_id}:{task_id} is {task_row['status']} and "
+                        "cannot register a workspace"
+                    )
             rows = conn.execute(
                 "SELECT * FROM workspaces WHERE board_id = ? AND task_id = ? "
                 "AND repo_id = ? AND status IN ('reserved', 'active') "
@@ -968,7 +1032,7 @@ def prepare_terminal_disposition(
     for record in owned:
         raw_text = str(by_id[record.workspace_id]).strip()
         kind, detail = _parse_disposition(raw_text)
-        exists = Path(record.workspace_path).exists()
+        exists = os.path.lexists(record.workspace_path)
         if kind == "retired":
             if exists:
                 status_raw = _git(
@@ -1493,16 +1557,84 @@ def has_terminal_disposition_intents(*, board_id: str, task_id: str) -> bool:
     return row is not None
 
 
-@contextlib.contextmanager
-def task_evidence_deletion_guard(*, board_id: str, task_id: str):
-    """Serialize hard deletion against lifecycle registration and intents.
+@dataclass
+class _TaskEvidenceDeletionGuard:
+    evidence_required: bool
+    operation_id: Optional[str] = None
+    preserve_fence: bool = False
 
-    The registry write lock is held across the caller's task-DB transaction, so
-    a new workspace row or terminal intent cannot appear between validation and
-    task deletion. ``True`` means durable task evidence is still required.
-    """
+    def __bool__(self) -> bool:
+        return self.evidence_required
+
+
+def _process_started_at() -> Optional[float]:
+    try:
+        return float(psutil.Process(os.getpid()).create_time())
+    except Exception:
+        return None
+
+
+def _insert_task_lifecycle_fence(
+    registry: sqlite3.Connection,
+    *,
+    board_id: str,
+    task_id: str,
+    fence_kind: str,
+    terminal_status: Optional[str],
+    task_db_path: Path | str,
+    operation_id: str,
+    replace_terminal: bool = False,
+) -> None:
+    existing = registry.execute(
+        "SELECT fence_kind FROM task_lifecycle_fences "
+        "WHERE board_id = ? AND task_id = ?",
+        (board_id, task_id),
+    ).fetchone()
+    if existing is not None:
+        if not (replace_terminal and str(existing["fence_kind"]) == "terminal"):
+            raise RuntimeError(
+                f"task {board_id}:{task_id} already has a lifecycle fence"
+            )
+        registry.execute(
+            "DELETE FROM task_lifecycle_fences WHERE board_id = ? AND task_id = ?",
+            (board_id, task_id),
+        )
+    registry.execute(
+        "INSERT INTO task_lifecycle_fences ("
+        "board_id, task_id, fence_kind, terminal_status, task_db_path, "
+        "operation_id, owner_host, owner_pid, owner_started_at, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            board_id,
+            task_id,
+            fence_kind,
+            terminal_status,
+            _canonical(task_db_path),
+            operation_id,
+            socket.gethostname() or "unknown",
+            os.getpid(),
+            _process_started_at(),
+            int(time.time()),
+        ),
+    )
+
+
+def _remove_task_lifecycle_fence(operation_id: str) -> None:
+    with contextlib.closing(connect_registry()) as registry:
+        registry.execute(
+            "DELETE FROM task_lifecycle_fences WHERE operation_id = ?",
+            (operation_id,),
+        )
+
+
+@contextlib.contextmanager
+def task_evidence_deletion_guard(
+    *, board_id: str, task_id: str, task_db_path: Path | str
+):
+    """Serialize hard deletion and leave a durable no-registration fence."""
     with contextlib.closing(connect_registry()) as registry:
         registry.execute("BEGIN IMMEDIATE")
+        guard = _TaskEvidenceDeletionGuard(evidence_required=True)
         try:
             intent = registry.execute(
                 "SELECT 1 FROM terminal_disposition_intents "
@@ -1514,7 +1646,25 @@ def task_evidence_deletion_guard(*, board_id: str, task_id: str):
                 "AND status NOT IN ('retired', 'creation_failed') LIMIT 1",
                 (board_id, task_id),
             ).fetchone()
-            yield intent is not None or workspace is not None
+            guard.evidence_required = intent is not None or workspace is not None
+            if not guard.evidence_required:
+                guard.operation_id = "tf_" + uuid.uuid4().hex
+                _insert_task_lifecycle_fence(
+                    registry,
+                    board_id=board_id,
+                    task_id=task_id,
+                    fence_kind="deletion",
+                    terminal_status=None,
+                    task_db_path=task_db_path,
+                    operation_id=guard.operation_id,
+                    replace_terminal=True,
+                )
+            yield guard
+            if guard.operation_id is not None and not guard.preserve_fence:
+                registry.execute(
+                    "DELETE FROM task_lifecycle_fences WHERE operation_id = ?",
+                    (guard.operation_id,),
+                )
             registry.execute("COMMIT")
         except BaseException:
             if registry.in_transaction:
@@ -1528,8 +1678,10 @@ def terminal_task_transaction(
     plans: list[_TerminalDispositionPlan],
     *,
     terminal_status: str,
+    board_id: str,
+    task_id: str,
 ):
-    """Wrap a task write transaction in the durable intent protocol."""
+    """Fence registration, then wrap the task write in the intent protocol."""
     from hermes_cli import kanban_db
 
     task_db_path = ""
@@ -1537,21 +1689,63 @@ def terminal_task_transaction(
         if str(row[1]) == "main":
             task_db_path = str(row[2] or "")
             break
-    if plans and not task_db_path:
-        raise RuntimeError("terminal disposition requires a file-backed task database")
-    operation_id = stage_terminal_disposition_intent(
-        plans,
-        terminal_status=terminal_status,
-        task_db_path=task_db_path,
+    if not task_db_path:
+        raise RuntimeError("terminal transition requires a file-backed task database")
+
+    fence_operation_id = "tf_" + uuid.uuid4().hex
+    current_task = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    replace_existing_terminal_fence = bool(
+        current_task is not None
+        and str(current_task["status"]) in {"done", "archived"}
     )
+    with contextlib.closing(connect_registry()) as registry:
+        registry.execute("BEGIN IMMEDIATE")
+        try:
+            _insert_task_lifecycle_fence(
+                registry,
+                board_id=board_id,
+                task_id=task_id,
+                fence_kind="terminal",
+                terminal_status=terminal_status,
+                task_db_path=task_db_path,
+                operation_id=fence_operation_id,
+                replace_terminal=replace_existing_terminal_fence,
+            )
+            planned_workspace_ids = {plan.record.workspace_id for plan in plans}
+            unexpected = registry.execute(
+                "SELECT workspace_id FROM workspaces WHERE board_id = ? "
+                "AND task_id = ? AND status NOT IN ('retired', 'creation_failed')",
+                (board_id, task_id),
+            ).fetchall()
+            unexpected_ids = {
+                str(row["workspace_id"]) for row in unexpected
+            } - planned_workspace_ids
+            if unexpected_ids:
+                raise RuntimeError(
+                    f"task {board_id}:{task_id} gained workspace registrations "
+                    "during terminal transition preparation; retry with an explicit "
+                    f"workspace disposition (unexpected={sorted(unexpected_ids)})"
+                )
+            registry.execute("COMMIT")
+        except BaseException:
+            if registry.in_transaction:
+                registry.execute("ROLLBACK")
+            raise
+
+    operation_id: Optional[str] = None
     try:
+        operation_id = stage_terminal_disposition_intent(
+            plans,
+            terminal_status=terminal_status,
+            task_db_path=task_db_path,
+        )
         with kanban_db.write_txn(conn):
             yield operation_id
     except BaseException:
         # write_txn handles ordinary Exception, but BaseException subclasses
         # such as KeyboardInterrupt/SystemExit bypass its rollback handler.
-        # Never reconcile registry evidence while uncommitted task changes are
-        # still visible on this connection.
         if conn.in_transaction:
             try:
                 conn.execute("ROLLBACK")
@@ -1562,8 +1756,6 @@ def terminal_task_transaction(
                 )
         if operation_id is not None and not conn.in_transaction:
             try:
-                # Inspect durable task state rather than assuming COMMIT failed;
-                # write_txn can surface a post-commit invariant error.
                 finalize_terminal_disposition_intent(operation_id)
             except Exception:
                 _log.exception(
@@ -1576,6 +1768,12 @@ def terminal_task_transaction(
                 "state is uncertain",
                 operation_id,
             )
+        if not conn.in_transaction:
+            task_row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task_row is not None and str(task_row["status"]) != terminal_status:
+                _remove_task_lifecycle_fence(fence_operation_id)
         raise
     else:
         if operation_id is not None:
@@ -1584,6 +1782,11 @@ def terminal_task_transaction(
                 raise RuntimeError(
                     f"terminal intent {operation_id} could not be reconciled"
                 )
+        task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task_row is None or str(task_row["status"]) != terminal_status:
+            _remove_task_lifecycle_fence(fence_operation_id)
 
 
 def _apply_terminal_plans(

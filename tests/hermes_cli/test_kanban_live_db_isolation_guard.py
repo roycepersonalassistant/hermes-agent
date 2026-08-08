@@ -12,6 +12,7 @@ path is created or opened.
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import subprocess
 import sys
@@ -152,6 +153,63 @@ class TestProductionKanbanPathRefused:
 
         kanban_db._ensure_test_isolation(temp_db)
         assert not temp_db.exists()
+
+    def test_lexical_root_stays_denied_after_parent_symlink_is_repointed(
+        self, tmp_path, monkeypatch
+    ):
+        first = tmp_path / "first-target"
+        second = tmp_path / "second-target"
+        first.mkdir()
+        second.mkdir()
+        production_link = tmp_path / "production-link"
+        production_link.symlink_to(first, target_is_directory=True)
+        payload = json.dumps(
+            [
+                {
+                    "lexical": str(production_link),
+                    "resolved": str(production_link.resolve()),
+                }
+            ]
+        )
+        monkeypatch.setenv("_HERMES_TEST_KANBAN_DENY_ROOTS", payload)
+        monkeypatch.setattr(kanban_db, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", ())
+
+        production_link.unlink()
+        production_link.symlink_to(second, target_is_directory=True)
+        candidate = production_link / "arbitrary" / "cache.sqlite3"
+
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            kanban_db._ensure_test_isolation(candidate)
+
+    def test_non_board_database_filename_under_denied_root_is_blocked(
+        self, tmp_path, monkeypatch
+    ):
+        production_root = tmp_path / "production"
+        candidate = production_root / "unrelated" / "state.sqlite3"
+        monkeypatch.setattr(
+            kanban_db, "_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS", (production_root,)
+        )
+
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            kanban_db._ensure_test_isolation(candidate)
+
+    @pytest.mark.skipif(os.pathsep == ";", reason="POSIX path-separator case")
+    def test_json_encoded_exact_pin_preserves_path_separator_characters(
+        self, tmp_path, monkeypatch
+    ):
+        inherited_db = tmp_path / "pin:with:separators" / "custom.sqlite3"
+        payload = json.dumps(
+            [
+                {
+                    "lexical": str(inherited_db),
+                    "resolved": str(inherited_db.resolve(strict=False)),
+                }
+            ]
+        )
+        monkeypatch.setenv("_HERMES_TEST_KANBAN_DENY_DBS", payload)
+
+        with pytest.raises(RuntimeError, match="live-system guard"):
+            kanban_db._ensure_test_isolation(inherited_db)
 
 
 class TestHermeticKanbanPathAllowed:

@@ -431,13 +431,22 @@ _KANBAN_DB_GUARD_BYPASS_ENV = "_HERMES_TEST_KANBAN_GUARD_BYPASS"
 _KANBAN_DB_GUARD_ACTIVE_ENV = "_HERMES_TEST_KANBAN_GUARD_ACTIVE"
 
 
-def _real_platform_kanban_root() -> Optional[Path]:
-    """Resolve the platform-default Hermes root without ``Path.home()``.
+def _lexical_path(value: Path | str) -> Path:
+    """Normalize without following symlinks, preserving lexical containment."""
+    return Path(os.path.abspath(os.path.expanduser(str(value))))
 
-    Tests frequently monkeypatch ``Path.home``. ``expanduser`` follows the
-    process HOME/passwd state instead, which is also inherited by subprocess
-    children and lets the guard identify their real platform root.
-    """
+
+def _path_pair(value: Path | str) -> tuple[Path, Path]:
+    lexical = _lexical_path(value)
+    try:
+        resolved = lexical.resolve(strict=False)
+    except (OSError, RuntimeError):
+        resolved = lexical
+    return lexical, resolved
+
+
+def _real_platform_kanban_root() -> Optional[tuple[Path, Path]]:
+    """Capture immutable lexical and resolved platform-root identities."""
     try:
         if sys.platform == "win32":
             base = os.environ.get("LOCALAPPDATA", "").strip()
@@ -451,13 +460,13 @@ def _real_platform_kanban_root() -> Optional[Path]:
             )
         else:
             root = Path(os.path.expanduser("~")) / ".hermes"
-        return root.resolve()
+        return _path_pair(root)
     except Exception:
         return None
 
 
-# Capture once at import. Tests are allowed to mutate HOME, but that must not
-# redefine which operator root is production midway through a process.
+# Capture once at import. Tests may mutate HOME or repoint symlinks, but neither
+# operation may redefine the immutable production-root identities.
 _KANBAN_DB_GUARD_PLATFORM_ROOT = _real_platform_kanban_root()
 
 
@@ -470,57 +479,51 @@ def _running_under_pytest() -> bool:
     )
 
 
-def _lexical_path(value: Path | str) -> Path:
-    """Normalize without following symlinks, preserving lexical containment."""
-    return Path(os.path.abspath(os.path.expanduser(str(value))))
+def _decode_guard_pairs(raw: str) -> list[tuple[Path, Path]]:
+    if not raw.strip():
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return [_path_pair(raw)]
+    if not isinstance(payload, list):
+        return []
+    pairs: list[tuple[Path, Path]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        lexical = item.get("lexical")
+        resolved = item.get("resolved")
+        if isinstance(lexical, str) and isinstance(resolved, str):
+            pairs.append((_lexical_path(lexical), _lexical_path(resolved)))
+    return pairs
 
 
-def _production_kanban_roots() -> list[Path]:
-    roots: list[Path] = []
-    real_root = _KANBAN_DB_GUARD_PLATFORM_ROOT
-    if real_root is not None:
-        roots.append(real_root)
-    for extra in _KANBAN_DB_GUARD_EXTRA_DENY_ROOTS:
-        try:
-            roots.append(Path(extra).expanduser().resolve())
-        except Exception:
-            continue
-    for raw in os.environ.get(_KANBAN_DB_GUARD_DENY_ROOTS_ENV, "").split(
-        os.pathsep
-    ):
-        if not raw.strip():
-            continue
-        try:
-            roots.append(Path(raw).expanduser().resolve())
-        except Exception:
-            continue
+def _production_kanban_roots() -> list[tuple[Path, Path]]:
+    roots: list[tuple[Path, Path]] = []
+    if _KANBAN_DB_GUARD_PLATFORM_ROOT is not None:
+        roots.append(_KANBAN_DB_GUARD_PLATFORM_ROOT)
+    roots.extend(_path_pair(extra) for extra in _KANBAN_DB_GUARD_EXTRA_DENY_ROOTS)
+    roots.extend(
+        _decode_guard_pairs(os.environ.get(_KANBAN_DB_GUARD_DENY_ROOTS_ENV, ""))
+    )
     return roots
 
 
-def _production_kanban_dbs() -> list[Path]:
-    dbs = [Path(path) for path in _KANBAN_DB_GUARD_EXTRA_DENY_DBS]
-    for raw in os.environ.get(_KANBAN_DB_GUARD_DENY_DBS_ENV, "").split(
-        os.pathsep
-    ):
-        if raw.strip():
-            dbs.append(Path(raw).expanduser())
+def _production_kanban_dbs() -> list[tuple[Path, Path]]:
+    dbs = [_path_pair(path) for path in _KANBAN_DB_GUARD_EXTRA_DENY_DBS]
+    dbs.extend(
+        _decode_guard_pairs(os.environ.get(_KANBAN_DB_GUARD_DENY_DBS_ENV, ""))
+    )
     return dbs
 
 
-def _is_production_kanban_db(candidate: Path, root: Path) -> bool:
-    """Return whether *candidate* is a default or named board under *root*."""
-    if candidate == root / "kanban.db":
-        return True
+def _is_within(candidate: Path, root: Path) -> bool:
     try:
-        parts = candidate.relative_to(root).parts
+        candidate.relative_to(root)
     except ValueError:
         return False
-    return (
-        len(parts) == 4
-        and parts[0] == "kanban"
-        and parts[1] == "boards"
-        and parts[3] == "kanban.db"
-    )
+    return True
 
 
 def _ensure_test_isolation(db_path: Path) -> None:
@@ -537,12 +540,7 @@ def _ensure_test_isolation(db_path: Path) -> None:
     except (OSError, RuntimeError):
         resolved = lexical
 
-    for denied_db in _production_kanban_dbs():
-        denied_lexical = _lexical_path(denied_db)
-        try:
-            denied_resolved = denied_lexical.resolve(strict=False)
-        except (OSError, RuntimeError):
-            denied_resolved = denied_lexical
+    for denied_lexical, denied_resolved in _production_kanban_dbs():
         if lexical == denied_lexical or resolved == denied_resolved:
             raise RuntimeError(
                 "live-system guard (kanban_write_guard): test attempted to open "
@@ -550,15 +548,10 @@ def _ensure_test_isolation(db_path: Path) -> None:
                 "safety probes must redirect or clear every Kanban DB pin."
             )
 
-    for root in _production_kanban_roots():
-        root_lexical = _lexical_path(root)
-        try:
-            root_resolved = root_lexical.resolve(strict=False)
-        except (OSError, RuntimeError):
-            root_resolved = root_lexical
-        if _is_production_kanban_db(
-            lexical, root_lexical
-        ) or _is_production_kanban_db(resolved, root_resolved):
+    for root_lexical, root_resolved in _production_kanban_roots():
+        if _is_within(lexical, root_lexical) or _is_within(
+            resolved, root_resolved
+        ):
             raise RuntimeError(
                 "live-system guard (kanban_write_guard): test attempted to open "
                 "production "
@@ -5181,7 +5174,11 @@ def complete_task(
     from hermes_cli import kanban_workspaces as _workspaces
 
     with _workspaces.terminal_task_transaction(
-        conn, _terminal_plans, terminal_status="done"
+        conn,
+        _terminal_plans,
+        terminal_status="done",
+        board_id=_board_for_connection(conn),
+        task_id=task_id,
     ) as _terminal_operation_id:
         if expected_run_id is None:
             cur = conn.execute(
@@ -6602,6 +6599,13 @@ def _board_for_connection(conn: sqlite3.Connection) -> str:
     raise RuntimeError(f"cannot resolve Kanban board for database {resolved}")
 
 
+def _db_path_for_connection(conn: sqlite3.Connection) -> Path:
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if str(row[1]) == "main" and str(row[2] or ""):
+            return Path(str(row[2])).expanduser().resolve(strict=False)
+    raise RuntimeError("cannot resolve a file-backed Kanban database")
+
+
 def archive_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6621,7 +6625,11 @@ def archive_task(
     from hermes_cli import kanban_workspaces as _workspaces
 
     with _workspaces.terminal_task_transaction(
-        conn, terminal_plans, terminal_status="archived"
+        conn,
+        terminal_plans,
+        terminal_status="archived",
+        board_id=_board_for_connection(conn),
+        task_id=task_id,
     ) as terminal_operation_id:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -6662,9 +6670,11 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         board_id=board_id, task_id=task_id
     )
     with _workspaces.task_evidence_deletion_guard(
-        board_id=board_id, task_id=task_id
-    ) as evidence_required:
-        if evidence_required:
+        board_id=board_id,
+        task_id=task_id,
+        task_db_path=_db_path_for_connection(conn),
+    ) as deletion_guard:
+        if deletion_guard:
             return False
         with write_txn(conn):
             row = conn.execute(
@@ -6682,7 +6692,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
             conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
             cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            return cur.rowcount == 1
+            deleted = cur.rowcount == 1
+            deletion_guard.preserve_fence = deleted
+            return deleted
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -6702,9 +6714,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         board_id=board_id, task_id=task_id
     )
     with _workspaces.task_evidence_deletion_guard(
-        board_id=board_id, task_id=task_id
-    ) as evidence_required:
-        if evidence_required:
+        board_id=board_id,
+        task_id=task_id,
+        task_db_path=_db_path_for_connection(conn),
+    ) as deletion_guard:
+        if deletion_guard:
             return False
         with write_txn(conn):
             cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -6715,6 +6729,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
             conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
             conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+            deletion_guard.preserve_fence = True
     recompute_ready(conn)
     return True
 
@@ -6934,6 +6949,7 @@ def _ensure_registered_git_worktree(
             owner_profile=task.assignee,
             branch=branch_name,
             replacement_reason=getattr(task, "workspace_replacement_reason", None),
+            task_db_path=kanban_db_path(board_id),
         )
         reserved_target = Path(reservation.workspace_path)
 

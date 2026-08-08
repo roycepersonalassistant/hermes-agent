@@ -443,6 +443,36 @@ def test_retired_disposition_rejects_stale_git_worktree_registration(
         assert kb.get_task(conn, task_id).status == "ready"
 
 
+def test_retired_disposition_rejects_dangling_workspace_symlink(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "dangling-workspace"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="dangling workspace",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/dangling-workspace",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+        _git(repo, "worktree", "remove", "--force", str(target))
+        target.symlink_to(tmp_path / "missing-target", target_is_directory=True)
+
+        with pytest.raises(
+            RuntimeError, match="could not verify Git status|still exists"
+        ):
+            kb.complete_task(
+                conn,
+                task_id,
+                metadata={"workspace_disposition": "retired"},
+            )
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
 @pytest.mark.parametrize("artifact_kind", ["inside-worktree", "directory", "symlink"])
 def test_preserved_dirty_requires_independently_durable_regular_artifact(
     kanban_home, tmp_path, artifact_kind
@@ -1245,6 +1275,128 @@ def test_hard_delete_preserves_task_evidence_required_by_workspace_registry(
         "retirement_queued": "retirement_queued",
     }[lifecycle_status]
     assert records[0].status == expected
+
+
+@pytest.mark.parametrize("terminal_api", ["complete_task", "archive_task"])
+def test_terminal_transition_and_workspace_registration_are_serialized(
+    kanban_home, tmp_path, monkeypatch, terminal_api
+):
+    repo = _make_repo(tmp_path)
+    workspace = repo / ".worktrees" / f"race-{terminal_api}"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"race {terminal_api}")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        conn.commit()
+
+    registry_locked = threading.Event()
+    release_registry = threading.Event()
+    original_connect_registry = kw.connect_registry
+
+    class PausingRegistry:
+        def __init__(self, inner):
+            self._inner = inner
+            self._paused = False
+
+        def execute(self, sql, parameters=()):
+            if "INSERT INTO workspaces" in sql and not self._paused:
+                self._paused = True
+                registry_locked.set()
+                assert release_registry.wait(timeout=10)
+            return self._inner.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    def pausing_connect_registry():
+        return PausingRegistry(original_connect_registry())
+
+    monkeypatch.setattr(kw, "connect_registry", pausing_connect_registry)
+
+    def register_workspace():
+        return kw.reserve_workspace(
+            repo_path=repo,
+            workspace_path=workspace,
+            task_id=task_id,
+            board_id="default",
+            owner_profile="developer",
+            task_db_path=kb.kanban_db_path(),
+        )
+
+    def transition_task():
+        with kb.connect() as conn:
+            if terminal_api == "complete_task":
+                return kb.complete_task(conn, task_id)
+            return kb.archive_task(conn, task_id)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        registration = pool.submit(register_workspace)
+        assert registry_locked.wait(timeout=10)
+        transition = pool.submit(transition_task)
+        release_registry.set()
+        assert registration.result(timeout=10).task_id == task_id
+        with pytest.raises(RuntimeError, match="gained workspace registrations"):
+            transition.result(timeout=10)
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
+    assert len(kw.list_workspace_records(task_id=task_id)) == 1
+
+
+@pytest.mark.parametrize("delete_api", ["delete_task", "delete_archived_task"])
+def test_deletion_fence_blocks_concurrent_workspace_registration(
+    kanban_home, tmp_path, monkeypatch, delete_api
+):
+    repo = _make_repo(tmp_path)
+    workspace = repo / ".worktrees" / f"race-{delete_api}"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"race {delete_api}")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        conn.commit()
+        if delete_api == "delete_archived_task":
+            assert kb.archive_task(conn, task_id)
+
+    fence_installed = threading.Event()
+    release_deletion = threading.Event()
+    original_insert_fence = kw._insert_task_lifecycle_fence
+
+    def pausing_insert_fence(registry, **kwargs):
+        original_insert_fence(registry, **kwargs)
+        if kwargs["fence_kind"] == "deletion":
+            fence_installed.set()
+            assert release_deletion.wait(timeout=10)
+
+    monkeypatch.setattr(kw, "_insert_task_lifecycle_fence", pausing_insert_fence)
+
+    def delete_task():
+        with kb.connect() as conn:
+            return getattr(kb, delete_api)(conn, task_id)
+
+    def register_workspace():
+        try:
+            return kw.reserve_workspace(
+                repo_path=repo,
+                workspace_path=workspace,
+                task_id=task_id,
+                board_id="default",
+                owner_profile="developer",
+                task_db_path=kb.kanban_db_path(),
+            )
+        except RuntimeError as exc:
+            return exc
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        deletion = pool.submit(delete_task)
+        assert fence_installed.wait(timeout=10)
+        registration = pool.submit(register_workspace)
+        release_deletion.set()
+        assert deletion.result(timeout=10)
+        error = registration.result(timeout=10)
+        assert isinstance(error, RuntimeError)
+        assert "fenced for deletion" in str(error)
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id) is None
+    assert kw.list_workspace_records(task_id=task_id) == []
 
 
 def test_archive_cli_records_direct_disposition_and_reuses_completed_one(
