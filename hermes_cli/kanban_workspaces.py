@@ -840,6 +840,54 @@ def verify_workspace(
             raise
 
 
+def adopt_existing_workspace(
+    *,
+    repo_path: Path | str,
+    workspace_path: Path | str,
+    task_id: str,
+    board_id: str,
+    owner_profile: Optional[str],
+    purpose: str = "review",
+    cleanup_policy: str = "on_task_terminal",
+    retention_condition: Optional[str] = "task_terminal",
+    task_db_path: Optional[Path | str] = None,
+) -> WorkspaceRecord:
+    """Register and verify an existing task-owned Git worktree.
+
+    This is the explicit adoption seam for guarded helpers that must create a
+    checkout with ``git worktree add`` before handing its ownership to Hermes.
+    It never discovers or adopts unknown paths implicitly: callers must name
+    the repository, checkout, task, board, and lifecycle policy, and the task
+    database is checked before a new registry row can be written.
+    """
+    repo = _canonical_repo(repo_path)
+    target = _canonical(workspace_path)
+    physical = {
+        str(entry["workspace_path"]): entry for entry in _git_worktrees(repo)
+    }
+    entry = physical.get(target)
+    if entry is None:
+        raise RuntimeError(f"cannot adopt non-worktree path: {target}")
+    actual_branch = _git(target, "branch", "--show-current") or None
+    reservation = reserve_workspace(
+        repo_path=repo,
+        workspace_path=target,
+        task_id=task_id,
+        board_id=board_id,
+        owner_profile=owner_profile,
+        purpose=purpose,
+        branch=actual_branch,
+        cleanup_policy=cleanup_policy,
+        retention_condition=retention_condition,
+        task_db_path=task_db_path,
+    )
+    return verify_workspace(
+        reservation.workspace_id,
+        target,
+        reservation_token=reservation.reservation_token,
+    )
+
+
 def mark_creation_failed(
     workspace_id: str, reservation_token: Optional[str] = None
 ) -> None:

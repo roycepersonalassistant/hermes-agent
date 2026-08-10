@@ -2331,6 +2331,55 @@ def test_repository_identity_is_shared_by_primary_and_linked_checkouts(
     assert len(kw.list_workspace_records(task_id="t_repo_identity")) == 1
 
 
+def test_adopt_existing_workspace_registers_detached_task_owned_checkout(
+    tmp_path, kanban_home
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "review"
+    _git(repo, "worktree", "add", "--detach", str(target), "HEAD")
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="review exact head",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+
+    record = kw.adopt_existing_workspace(
+        repo_path=repo,
+        workspace_path=target,
+        task_id=task_id,
+        board_id="default",
+        owner_profile="reviewer",
+        task_db_path=kb.kanban_db_path(),
+    )
+
+    assert record.status == "active"
+    assert record.task_id == task_id
+    assert record.board_id == "default"
+    assert record.workspace_path == str(target.resolve())
+    assert record.branch is None
+
+
+def test_adopt_existing_workspace_rejects_missing_physical_checkout(
+    tmp_path, kanban_home
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "missing"
+
+    with pytest.raises(RuntimeError, match="cannot adopt non-worktree path"):
+        kw.adopt_existing_workspace(
+            repo_path=repo,
+            workspace_path=target,
+            task_id="t_missing",
+            board_id="default",
+            owner_profile="reviewer",
+            task_db_path=kb.kanban_db_path(),
+        )
+
+    assert kw.list_workspace_records(task_id="t_missing") == []
+
+
 def test_dispositions_require_recovery_owner_and_current_exception_policy(
     tmp_path, kanban_home, monkeypatch
 ):

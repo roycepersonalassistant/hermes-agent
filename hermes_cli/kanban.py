@@ -813,6 +813,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Allowlisted parent for removable worktrees (repeatable)",
     )
     p_wt_janitor.add_argument("--json", action="store_true")
+    p_wt_adopt = worktree_sub.add_parser(
+        "adopt",
+        help="Register an existing task-owned Git worktree",
+    )
+    p_wt_adopt.add_argument("--repo", required=True, help="Canonical Git repository")
+    p_wt_adopt.add_argument(
+        "--workspace", required=True, help="Existing linked worktree path"
+    )
+    p_wt_adopt.add_argument("--task-id", required=True, help="Owning Kanban task ID")
+    p_wt_adopt.add_argument(
+        "--owner-profile", default="reviewer", help="Owning Hermes profile"
+    )
+    p_wt_adopt.add_argument("--purpose", default="review")
+    p_wt_adopt.add_argument("--cleanup-policy", default="on_task_terminal")
+    p_wt_adopt.add_argument("--retention-condition", default="task_terminal")
+    p_wt_adopt.add_argument("--json", action="store_true")
     p_wt_exceptions = worktree_sub.add_parser(
         "exceptions",
         help="Manage explicit protected-worktree policies",
@@ -2828,6 +2844,25 @@ def _cmd_worktrees(args: argparse.Namespace) -> int:
                 approved_roots=getattr(args, "approved_root", []) or [],
             ),
         )
+    elif action == "adopt":
+        record = workspaces.adopt_existing_workspace(
+            repo_path=args.repo,
+            workspace_path=args.workspace,
+            task_id=args.task_id,
+            board_id=kb.get_current_board(),
+            owner_profile=args.owner_profile,
+            purpose=args.purpose,
+            cleanup_policy=args.cleanup_policy,
+            retention_condition=args.retention_condition,
+            task_db_path=kb.kanban_db_path(),
+        )
+        report = cast(dict[str, Any], {
+            "workspace_id": record.workspace_id,
+            "workspace_path": record.workspace_path,
+            "task_id": record.task_id,
+            "board_id": record.board_id,
+            "status": record.status,
+        })
     elif action == "exceptions" and getattr(args, "exception_action", None) == "import":
         report = cast(
             dict[str, Any],
@@ -2843,6 +2878,12 @@ def _cmd_worktrees(args: argparse.Namespace) -> int:
         print(
             "Protected worktree import: "
             f"{len(report['imported'])} imported, {len(report['skipped'])} skipped"
+        )
+        return 0
+    if action == "adopt":
+        print(
+            f"Adopted worktree {report['workspace_path']} "
+            f"for {report['board_id']}:{report['task_id']}"
         )
         return 0
     if action == "janitor":
